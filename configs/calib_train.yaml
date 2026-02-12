@@ -1,0 +1,69 @@
+# configs/calib_train.yaml
+exp:
+  name: calib_only_zju
+  out_dir: ./runs
+  seed: 123
+  device: cuda
+  amp: true
+
+data:
+  # 你自己的 ZJU 数据集 dataloader 类（按 BPNet 格式返回）
+  # 要求 __getitem__ 返回: rgb, dep_sp, Kcam, dep
+  dataset_class: "datasets.ZJU.ZJU4DRadarCam"
+  dataset_kwargs:
+    mode: train
+    path: "/data00/wsx/data/ZJU-4DRadarCam"
+    num_sample: 500
+    mul_factor: 1.0
+    num_mask: 1
+
+  num_workers: 4
+  train_batch_size: 4
+  val_batch_size: 2
+
+train:
+  epochs: 20
+  lr: 2.0e-4
+  weight_decay: 1.0e-4
+  log_every: 50
+  save_every: 1
+  val_every: 1
+  grad_clip_norm: 1.0
+
+model:
+  # BPNet 是 5 个尺度，这里也做 5 个尺度
+  num_scales: 5
+  # RGB pyramid encoder通道
+  rgb_channels: [32, 64, 96, 128, 160]
+  # radar base feature通道
+  radar_channels: [16, 24, 32, 40, 48]
+
+  # “对每一层的 s 做 encoder 下采样到 1/4”的实现
+  radar_token_down_ratio: 2     # 每尺度内部再 /4
+
+  # window SA
+  sa:
+    window: 5
+    heads: 4
+    dim_head: 16
+    dilation: 2
+
+  # CA（同位置融合）
+  ca:
+    out_dim: 64   # CA 后融合维度（会与 radar token concat）
+
+  # 残差精修
+  refine:
+    blocks: 2
+    use_channel_attn: true  # SE-like
+    se_reduction: 8
+
+loss:
+  # 稀疏监督：只在原 dep_sp>0 位置计算 S' vs dep(gt)
+  w_sparse: 1.0
+  # 保守正则：S' 不要偏离原 dep_sp 太多（防止乱飘）
+  w_consistency: 0.2
+  # 防止输出全 0：鼓励保留一定能量（soft，不是硬阈值）
+  w_energy: 0.01
+  # 多尺度监督权重（从细到粗）
+  ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]
