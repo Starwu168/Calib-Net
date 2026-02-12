@@ -18,11 +18,11 @@ data:
     num_mask: 1
 
   num_workers: 4
-  train_batch_size: 4
+  train_batch_size: 8
   val_batch_size: 2
 
 train:
-  epochs: 20
+  epochs: 60
   lr: 2.0e-4
   weight_decay: 1.0e-4
   log_every: 50

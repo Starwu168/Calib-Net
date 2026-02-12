@@ -14,7 +14,7 @@ from utils.config import load_yaml, get
 from utils.seed import set_seed
 from utils.checkpoint import save_checkpoint
 from utils.meters import AvgMeter
-from datas.builder import build_dataset, build_loader
+from datasets.builder import build_dataset, build_loader
 from models.calib_net import CalibOnlyNet
 
 
@@ -77,7 +77,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
     amp = cfg["exp"]["amp"]
 
     for step, batch in enumerate(loader):
-        rgb, dep_sp, Kcam, dep = batch  # 按你BPNet格式：rgb, dep_sp, Kcam, dep
+        rgb, dep_sp, Kcam, dep = batch
         rgb = rgb.to(device, non_blocking=True)
         dep_sp = dep_sp.to(device, non_blocking=True)
         dep = dep.to(device, non_blocking=True)
@@ -151,8 +151,13 @@ def main():
     print(f"[info] out_dir={out_dir}")
 
     # dataset
-    train_ds = build_dataset(cfg["data"]["dataset_class"], cfg["data"]["dataset_kwargs"] | {"mode": "train"})
-    val_ds   = build_dataset(cfg["data"]["dataset_class"], cfg["data"]["dataset_kwargs"] | {"mode": "val"})
+    train_kwargs = dict(cfg["data"]["dataset_kwargs"])
+    train_kwargs["mode"] = "train"
+    train_ds = build_dataset(cfg["data"]["dataset_class"], train_kwargs)
+
+    val_kwargs = dict(cfg["data"]["dataset_kwargs"])
+    val_kwargs["mode"] = "val"
+    val_ds = build_dataset(cfg["data"]["dataset_class"], val_kwargs)
 
     train_loader = build_loader(
         train_ds,
