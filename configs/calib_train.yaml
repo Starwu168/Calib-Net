@@ -25,7 +25,7 @@ train:
   epochs: 60
   lr: 2.0e-4
   weight_decay: 1.0e-4
-  log_every: 50
+  log_every: 814
   save_every: 1
   val_every: 1
   grad_clip_norm: 1.0
@@ -61,9 +61,9 @@ model:
 loss:
   # 稀疏监督：只在原 dep_sp>0 位置计算 S' vs dep(gt)
   w_sparse: 1.0
-  # 保守正则：S' 不要偏离原 dep_sp 太多（防止乱飘）
-  w_consistency: 0.2
-  # 防止输出全 0：鼓励保留一定能量（soft，不是硬阈值）
-  w_energy: 0.01
+
+  w_consistency: 0.3
+
+  w_energy: 0.05
   # 多尺度监督权重（从细到粗）
   ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

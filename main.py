@@ -2,81 +2,45 @@
 from __future__ import annotations
 import os
 import time
-import math
 import argparse
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
-from utils.config import load_yaml, get
+from utils.config import load_yaml
 from utils.seed import set_seed
 from utils.checkpoint import save_checkpoint
 from utils.meters import AvgMeter
-from datasets.builder import build_dataset, build_loader
+from datasets.builder import build_dataset
 from models.calib_net import CalibOnlyNet
+from train.criteria import compute_losses
+from utils.ddp import setup_ddp, ddp_cleanup
 
 
-def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
-    """
-    s_pred_list: list of S_l' (B,1,Hl,Wl)
-    dep_sp:      (B,1,H,W)
-    dep_gt:      (B,1,H,W)
-    """
-    ms_w = cfg_loss["ms_weights"]
-    assert len(ms_w) == len(s_pred_list)
-
-    B, _, H, W = dep_sp.shape
-    mask = (dep_sp > 0).float()  # 监督只在 radar 有效处
-    # 稀疏监督 target：GT
-    target = dep_gt
-
-    loss_sparse = 0.0
-    loss_consis = 0.0
-    loss_energy = 0.0
-
-    for l, s_l in enumerate(s_pred_list):
-        # upsample 回原图做监督
-        s_up = F.interpolate(s_l, size=(H, W), mode="bilinear", align_corners=False)
-
-        # 1) 稀疏监督：S'在mask处逼近GT
-        # smooth L1 更稳
-        ls = F.smooth_l1_loss(s_up * mask, target * mask, reduction="sum") / (mask.sum() + 1e-6)
-
-        # 2) 保守一致性：不要离原 dep_sp 太远（同样只在 mask）
-        lc = F.smooth_l1_loss(s_up * mask, dep_sp * mask, reduction="sum") / (mask.sum() + 1e-6)
-
-        # 3) 能量约束：鼓励输出在mask区域有一定能量，避免全0塌缩
-        # 让 mean(s_up on mask) 接近 dep_sp 的均值（弱约束）
-        mean_pred = (s_up * mask).sum() / (mask.sum() + 1e-6)
-        mean_src  = (dep_sp * mask).sum() / (mask.sum() + 1e-6)
-        le = (mean_pred - mean_src).abs()
-
-        loss_sparse += ms_w[l] * ls
-        loss_consis += ms_w[l] * lc
-        loss_energy += ms_w[l] * le
-
-    w_sparse = cfg_loss["w_sparse"]
-    w_consis = cfg_loss["w_consistency"]
-    w_energy = cfg_loss["w_energy"]
-
-    total = w_sparse * loss_sparse + w_consis * loss_consis + w_energy * loss_energy
-    return total, {
-        "loss_sparse": float(loss_sparse.detach().cpu()),
-        "loss_consis": float(loss_consis.detach().cpu()),
-        "loss_energy": float(loss_energy.detach().cpu()),
-    }
-
-
-def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
+def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch):
     model.train()
     meter = AvgMeter()
+    start_time = time.time()
 
     log_every = cfg["train"]["log_every"]
     amp = cfg["exp"]["amp"]
 
-    for step, batch in enumerate(loader):
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    pbar = tqdm(
+        loader,
+        total=len(loader),
+        dynamic_ncols=True,
+        desc=f"train e{epoch}",
+        disable=(rank != 0)
+    )
+
+    for step, batch in enumerate(pbar):
         rgb, dep_sp, Kcam, dep = batch
         rgb = rgb.to(device, non_blocking=True)
         dep_sp = dep_sp.to(device, non_blocking=True)
@@ -89,7 +53,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
             loss, parts = compute_losses(s_pred_list, dep_sp, dep, cfg["loss"])
 
         scaler.scale(loss).backward()
-        # 梯度裁剪
+
         if cfg["train"]["grad_clip_norm"] is not None:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["train"]["grad_clip_norm"])
@@ -97,9 +61,15 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
         scaler.step(optimizer)
         scaler.update()
 
+        elapsed = time.time() - start_time
+
         meter.update(loss=float(loss.detach().cpu()), n=rgb.size(0), parts=parts)
 
-        if (step + 1) % log_every == 0:
+        # tqdm显示（只在rank0）
+        pbar.set_postfix({"time": f"{elapsed/60:.1f}m"})
+
+        # 原有print保留，但只让rank0打印（否则多进程疯狂刷屏很慢）
+        if rank == 0 and (step + 1) % log_every == 0:
             print(
                 f"[train] step={step+1}/{len(loader)} "
                 f"loss={meter.avg('loss'):.6f} "
@@ -115,6 +85,7 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg):
 def validate(model, loader, device, cfg):
     model.eval()
     meter = AvgMeter()
+    rank = dist.get_rank() if dist.is_initialized() else 0
 
     for batch in loader:
         rgb, dep_sp, Kcam, dep = batch
@@ -122,16 +93,19 @@ def validate(model, loader, device, cfg):
         dep_sp = dep_sp.to(device, non_blocking=True)
         dep = dep.to(device, non_blocking=True)
 
-        s_pred_list = model(rgb, dep_sp)
-        loss, parts = compute_losses(s_pred_list, dep_sp, dep, cfg["loss"])
+        with autocast(enabled=cfg["exp"]["amp"]):
+            s_pred_list = model(rgb, dep_sp)
+            loss, parts = compute_losses(s_pred_list, dep_sp, dep, cfg["loss"])
+
         meter.update(loss=float(loss.detach().cpu()), n=rgb.size(0), parts=parts)
 
-    print(
-        f"[val] loss={meter.avg('loss'):.6f} "
-        f"sparse={meter.avg('loss_sparse'):.6f} "
-        f"consis={meter.avg('loss_consis'):.6f} "
-        f"energy={meter.avg('loss_energy'):.6f}"
-    )
+    if rank == 0:
+        print(
+            f"[val] loss={meter.avg('loss'):.6f} "
+            f"sparse={meter.avg('loss_sparse'):.6f} "
+            f"consis={meter.avg('loss_consis'):.6f} "
+            f"energy={meter.avg('loss_energy'):.6f}"
+        )
     return meter
 
 
@@ -140,17 +114,34 @@ def main():
     ap.add_argument("--config", type=str, required=True, help="path to yaml config")
     args = ap.parse_args()
 
+    # ---- DDP init (torchrun会注入LOCAL_RANK等) ----
+    local_rank = setup_ddp()  # 必须返回local_rank，并在内部 torch.cuda.set_device(local_rank)
+
     cfg = load_yaml(args.config)
 
-    set_seed(cfg["exp"]["seed"])
-    device = torch.device(cfg["exp"]["device"] if torch.cuda.is_available() else "cpu")
+    # ---- seed：每个rank不同更安全 ----
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    set_seed(cfg["exp"]["seed"] + rank)
 
-    # output dir
+    # ---- speed flags ----
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
+    # ✅ 关键：device必须绑定到local_rank
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+
+    # ---- out dir: 只在rank0创建/打印 ----
     out_dir = Path(cfg["exp"]["out_dir"]) / cfg["exp"]["name"]
-    out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[info] out_dir={out_dir}")
+    if rank == 0:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[info] out_dir={out_dir}")
 
-    # dataset
+    # ---- dataset ----
     train_kwargs = dict(cfg["data"]["dataset_kwargs"])
     train_kwargs["mode"] = "train"
     train_ds = build_dataset(cfg["data"]["dataset_class"], train_kwargs)
@@ -159,23 +150,43 @@ def main():
     val_kwargs["mode"] = "val"
     val_ds = build_dataset(cfg["data"]["dataset_class"], val_kwargs)
 
-    train_loader = build_loader(
+    # ✅ DDP: sampler
+    train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
+    val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)
+
+    train_loader = DataLoader(
         train_ds,
         batch_size=cfg["data"]["train_batch_size"],
+        sampler=train_sampler,
         num_workers=cfg["data"]["num_workers"],
-        shuffle=True
+        pin_memory=True,
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        prefetch_factor=4 if cfg["data"]["num_workers"] > 0 else None,
     )
-    val_loader = build_loader(
+
+    val_loader = DataLoader(
         val_ds,
         batch_size=cfg["data"]["val_batch_size"],
+        sampler=val_sampler,
         num_workers=cfg["data"]["num_workers"],
-        shuffle=False
+        pin_memory=True,
+        persistent_workers=(cfg["data"]["num_workers"] > 0),
+        prefetch_factor=4 if cfg["data"]["num_workers"] > 0 else None,
     )
 
-    # model
+    # ---- model ----
     model = CalibOnlyNet(cfg["model"]).to(device)
 
-    # optim
+    # ✅ DDP wrapper：每个进程只用自己的GPU
+    model = DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        broadcast_buffers=False,
+        find_unused_parameters=False,
+    )
+
+    # ---- optim ----
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["train"]["lr"],
@@ -187,28 +198,38 @@ def main():
     epochs = cfg["train"]["epochs"]
 
     for epoch in range(1, epochs + 1):
-        print(f"\n===== epoch {epoch}/{epochs} =====")
-        train_meter = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg)
+        # ✅ DDP: 每个epoch需要set_epoch保证shuffle正确
+        train_sampler.set_epoch(epoch)
+
+        if rank == 0:
+            print(f"\n===== epoch {epoch}/{epochs} =====")
+
+        train_meter = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch)
 
         if epoch % cfg["train"]["val_every"] == 0:
             val_meter = validate(model, val_loader, device, cfg)
             val_loss = val_meter.avg("loss")
 
-            is_best = val_loss < best_val
-            best_val = min(best_val, val_loss)
+            if rank == 0:
+                is_best = val_loss < best_val
+                best_val = min(best_val, val_loss)
 
-            if epoch % cfg["train"]["save_every"] == 0 or is_best:
-                save_checkpoint(
-                    out_dir=out_dir,
-                    epoch=epoch,
-                    model=model,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    best=is_best,
-                    extra={"val_loss": val_loss}
-                )
+                if epoch % cfg["train"]["save_every"] == 0 or is_best:
+                    save_checkpoint(
+                        out_dir=out_dir,
+                        epoch=epoch,
+                        # ✅ 保存真实模型参数
+                        model=model.module,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        best=is_best,
+                        extra={"val_loss": val_loss}
+                    )
 
-    print("[done]")
+    if rank == 0:
+        print("[done]")
+
+    ddp_cleanup()
 
 
 if __name__ == "__main__":

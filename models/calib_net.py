@@ -43,11 +43,13 @@ class TokenDecoder(nn.Module):
         return F.relu(s)  # 深度非负
 
 class PerScaleCalib(nn.Module):
-    def __init__(self, rgb_c: int, radar_c: int, sa_cfg: dict, ca_out_dim: int, refine_cfg: dict, token_down_ratio: int):
+    def __init__(self, rgb_c, radar_c, sa_cfg, ca_out_dim, refine_cfg, token_down_ratio):
         super().__init__()
-        self.token_down_ratio = token_down_ratio
 
-        self.token_enc = SparseTokenEncoder(out_c=radar_c, down_ratio=token_down_ratio)
+        self.token_enc = SparseTokenEncoder(
+            out_c=radar_c,
+            down_ratio=token_down_ratio
+        )
 
         self.sa = DilatedWindowSelfAttention2D(
             dim=radar_c,
@@ -71,36 +73,45 @@ class PerScaleCalib(nn.Module):
 
         blocks = [ResBlock(radar_c) for _ in range(refine_cfg["blocks"])]
         self.refine = nn.Sequential(*blocks)
-        self.se = SEBlock(radar_c, refine_cfg.get("se_reduction", 8)) if refine_cfg.get("use_channel_attn", True) else nn.Identity()
+        self.se = SEBlock(radar_c, refine_cfg.get("se_reduction", 8))
 
-        self.dec = TokenDecoder(radar_c)
+        # 关键改动：输出 ΔS 而不是直接输出 S
+        self.delta_head = nn.Sequential(
+            nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(radar_c),
+            nn.GELU(),
+            nn.Conv2d(radar_c, 1, 1)
+        )
 
-    def forward(self, S_l: torch.Tensor, M_l: torch.Tensor, fout_l: torch.Tensor):
-        """
-        S_l, M_l: (B,1,Hl,Wl) 该尺度 sparse depth + mask
-        fout_l:   (B,C,Hl,Wl) 该尺度 rgb features
-        输出: S'_l (B,1,Hl,Wl)
-        """
-        Hl, Wl = S_l.shape[-2], S_l.shape[-1]
+    def forward(self, S_l, M_l, fout_l):
+        Hl, Wl = S_l.shape[-2:]
 
-        # token encoder（masked maxpool 保点）
-        R_t, S_t, M_t = self.token_enc(S_l, M_l)  # R_t: (B,Cr,Ht,Wt)
+        # === token encode ===
+        R_t, S_t, M_t = self.token_enc(S_l, M_l)
 
-        # SA（mask-aware + dilated）
+        # === SA ===
         R_t = R_t + self.sa(R_t, M_t)
 
-        # CA（同位置融合）：把 RGB 插值到 token 分辨率
+        # === CA ===
         F_tok = F.interpolate(fout_l, size=R_t.shape[-2:], mode="bilinear", align_corners=False)
-        Z = self.ca(R_t, F_tok)  # (B,ca_out,Ht,Wt)
+        Z = self.ca(R_t, F_tok)
 
-        # 融合 + residual refine
         Fprime = self.fuse_proj(torch.cat([R_t, Z], dim=1))
-        delta = self.se(self.refine(Fprime))
-        F2 = Fprime + delta
+        delta_feat = self.se(self.refine(Fprime))
 
-        # decode to S'_l
-        S_l_pred = self.dec(F2, out_hw=(Hl, Wl))
-        return S_l_pred
+        # === 预测 ΔS (token 分辨率) ===
+        delta = self.delta_head(delta_feat)
+
+        # === 上采样回 Hl,Wl ===
+        delta = F.interpolate(delta, size=(Hl, Wl), mode="bilinear", align_corners=False)
+
+        # === 膨胀 mask（允许 3x3 邻域修正）===
+        M_dil = F.max_pool2d(M_l, kernel_size=3, stride=1, padding=1)
+
+        # === 残差修正 ===
+        S_pred = torch.relu(S_l + delta * M_dil)
+
+        return S_pred
 
 class CalibOnlyNet(nn.Module):
     """
