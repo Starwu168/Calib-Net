@@ -19,6 +19,7 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
     loss_sparse = 0.0
     loss_consis = 0.0
     loss_energy = 0.0
+    loss_outside = 0.0
 
     for l, s_l in enumerate(s_pred_list):
         # upsample 回原图做监督
@@ -32,16 +33,17 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
         lc = F.smooth_l1_loss(s_up * mask, dep_sp * mask, reduction="sum") / (mask.sum() + 1e-6)
 
         # 3) 残差幅度约束（防止 ΔS 过大）
-        delta_mag = torch.abs((s_up - dep_sp) * mask).mean()
+        delta_mag = torch.abs((s_up - dep_sp) * mask).sum() / (mask.sum() + 1e-6)
 
         mask_inv = 1.0 - mask
 
         # 强制mask外为0
-        l_outside = torch.abs(s_up * mask_inv).mean()
+        l_outside = torch.abs(s_up * mask_inv).sum() / (mask_inv.sum() + 1e-6)
 
         loss_sparse += ms_w[l] * ls
         loss_consis += ms_w[l] * lc
         loss_energy += ms_w[l] * delta_mag
+        loss_outside += ms_w[l] * l_outside
 
     w_sparse = cfg_loss["w_sparse"]
     w_consis = cfg_loss["w_consistency"]
