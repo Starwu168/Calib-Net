@@ -87,7 +87,9 @@ def main():
         s_pred_list = model(rgb, dep_sp)
         # 取 scale0 输出并 upsample 回原图尺寸
         s0 = s_pred_list[0]
-        s_up = F.interpolate(s0, size=dep_sp.shape[-2:], mode="bilinear", align_corners=False)
+        s_up = F.interpolate(s0, size=dep_sp.shape[-2:], mode="nearest")
+        # 强制只保留输入点位置（硬写死）
+        s_up = s_up * (dep_sp > 0).float()
 
         # to numpy
         rgb_vis = denorm_rgb(rgb).squeeze(0).permute(1,2,0).detach().cpu().numpy()

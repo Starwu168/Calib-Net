@@ -13,8 +13,7 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
     assert len(ms_w) == len(s_pred_list)
 
     B, _, H, W = dep_sp.shape
-    mask = (dep_sp > 0).float()  # 监督只在 radar 有效处
-    # 稀疏监督 target：GT
+    mask = (dep_sp > 0).float()
     target = dep_gt
 
     loss_sparse = 0.0
@@ -23,7 +22,7 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
 
     for l, s_l in enumerate(s_pred_list):
         # upsample 回原图做监督
-        s_up = F.interpolate(s_l, size=(H, W), mode="bilinear", align_corners=False)
+        s_up = F.interpolate(s_l, size=(H, W), mode="nearest")
 
         # 1) 稀疏监督：S'在mask处逼近GT
         # smooth L1 更稳
@@ -35,6 +34,11 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
         # 3) 残差幅度约束（防止 ΔS 过大）
         delta_mag = torch.abs((s_up - dep_sp) * mask).mean()
 
+        mask_inv = 1.0 - mask
+
+        # 强制mask外为0
+        l_outside = torch.abs(s_up * mask_inv).mean()
+
         loss_sparse += ms_w[l] * ls
         loss_consis += ms_w[l] * lc
         loss_energy += ms_w[l] * delta_mag
@@ -43,7 +47,7 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
     w_consis = cfg_loss["w_consistency"]
     w_energy = cfg_loss["w_energy"]
 
-    total = w_sparse * loss_sparse + w_consis * loss_consis + w_energy * loss_energy
+    total = w_sparse * loss_sparse + w_consis * loss_consis + w_energy * loss_energy + 0.1 * l_outside
     return total, {
         "loss_sparse": float(loss_sparse.detach().cpu()),
         "loss_consis": float(loss_consis.detach().cpu()),

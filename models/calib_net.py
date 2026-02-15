@@ -75,7 +75,6 @@ class PerScaleCalib(nn.Module):
         self.refine = nn.Sequential(*blocks)
         self.se = SEBlock(radar_c, refine_cfg.get("se_reduction", 8))
 
-        # 关键改动：输出 ΔS 而不是直接输出 S
         self.delta_head = nn.Sequential(
             nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
             nn.BatchNorm2d(radar_c),
@@ -103,9 +102,9 @@ class PerScaleCalib(nn.Module):
         delta = self.delta_head(delta_feat)
 
         # === 上采样回 Hl,Wl ===
-        delta = F.interpolate(delta, size=(Hl, Wl), mode="bilinear", align_corners=False)
+        delta = F.interpolate(delta, size=(Hl, Wl), mode="nearest")
 
-        # === 膨胀 mask（允许 3x3 邻域修正）===
+        # === 膨胀 mask（允许 n*n 邻域修正）===
         M_dil = F.max_pool2d(M_l, kernel_size=3, stride=1, padding=1)
 
         # === 残差修正 ===
