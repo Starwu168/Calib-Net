@@ -65,5 +65,7 @@ loss:
   w_consistency: 0.3
 
   w_energy: 0.05
+
+  w_outside: 0.1
   # 多尺度监督权重（从细到粗）
   ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

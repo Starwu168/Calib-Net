@@ -48,8 +48,9 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict):
     w_sparse = cfg_loss["w_sparse"]
     w_consis = cfg_loss["w_consistency"]
     w_energy = cfg_loss["w_energy"]
+    w_outside = cfg_loss["w_outside"]
 
-    total = w_sparse * loss_sparse + w_consis * loss_consis + w_energy * loss_energy + 0.1 * l_outside
+    total = w_sparse * loss_sparse + w_consis * loss_consis + w_energy * loss_energy + w_outside* l_outside
     return total, {
         "loss_sparse": float(loss_sparse.detach().cpu()),
         "loss_consis": float(loss_consis.detach().cpu()),
