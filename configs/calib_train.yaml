@@ -18,14 +18,14 @@ data:
     num_mask: 1
 
   num_workers: 4
-  train_batch_size: 40
+  train_batch_size: 36
   val_batch_size: 2
 
 train:
   epochs: 60
   lr: 2.0e-4
   weight_decay: 1.0e-4
-  log_every: 814
+  log_every: 181
   save_every: 1
   val_every: 1
   grad_clip_norm: 1.0
