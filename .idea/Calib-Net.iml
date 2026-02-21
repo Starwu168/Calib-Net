@@ -4,7 +4,7 @@
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
     </content>
-    <orderEntry type="jdk" jdkName="Remote Python 3.8.20 (sftp://bjtu@219.242.112.208:22/data00/conda/miniconda3/envs/bpnet/bin/python3.8)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Remote 3.8 (sftp://bjtu@219.242.112.208:22/data00/conda/miniconda3/envs/bpnet/bin/python3.8)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

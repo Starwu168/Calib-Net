@@ -11,72 +11,93 @@ class DCMetrics:
     computed on mask: gt > t_valid
     """
     def __init__(self, t_valid: float = 1e-3, eps: float = 1e-6):
-        self.t_valid = float(t_valid)
-        self.eps = float(eps)
+        self.t_valid = t_valid
+        self.eps = eps
         self.reset()
 
     def reset(self):
-        self.sum_abs = 0.0
-        self.sum_sq = 0.0
-        self.sum_abs_inv = 0.0
-        self.sum_sq_inv = 0.0
-        self.sum_absrel = 0.0
-        self.sum_sqrel = 0.0
-        self.count = 0.0
+        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        self.sum_abs = torch.zeros(1, device=dev)
+        self.sum_sq = torch.zeros(1, device=dev)
+        self.sum_abs_rel = torch.zeros(1, device=dev)
+        self.sum_sq_rel = torch.zeros(1, device=dev)
+        self.sum_iabs = torch.zeros(1, device=dev)
+        self.sum_isq = torch.zeros(1, device=dev)
+        self.count = torch.zeros(1, device=dev)
+
+        # ✅ delta counts
+        self.sum_d1 = torch.zeros(1, device=dev)
+        self.sum_d2 = torch.zeros(1, device=dev)
+        self.sum_d3 = torch.zeros(1, device=dev)
 
     @torch.no_grad()
     def update(self, pred: torch.Tensor, gt: torch.Tensor):
-        # (B,1,H,W)
-        valid = (gt > self.t_valid)
-        if valid.sum() == 0:
+        # pred/gt: (B,1,H,W) or (B,H,W)
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(1)
+        if gt.dim() == 3:
+            gt = gt.unsqueeze(1)
+
+        m = (gt > self.t_valid)
+        if m.sum() == 0:
             return
 
-        p = pred[valid].double()
-        g = gt[valid].double()
+        p = pred[m].float()
+        g = gt[m].float()
+
         diff = p - g
+        abs_diff = diff.abs()
 
-        self.sum_abs += diff.abs().sum().item()
-        self.sum_sq += (diff * diff).sum().item()
+        self.sum_abs += abs_diff.sum()
+        self.sum_sq += (diff * diff).sum()
 
-        p_inv = 1.0 / (p + self.eps)
-        g_inv = 1.0 / (g + self.eps)
-        diff_inv = p_inv - g_inv
+        self.sum_abs_rel += (abs_diff / (g + self.eps)).sum()
+        self.sum_sq_rel += ((diff * diff) / (g + self.eps)).sum()
 
-        self.sum_abs_inv += diff_inv.abs().sum().item()
-        self.sum_sq_inv += (diff_inv * diff_inv).sum().item()
+        ip = 1.0 / (p + self.eps)
+        ig = 1.0 / (g + self.eps)
+        idiff = (ip - ig).abs()
+        self.sum_iabs += idiff.sum()
+        self.sum_isq += (idiff * idiff).sum()
 
-        self.sum_absrel += (diff.abs() / (g + self.eps)).sum().item()
-        self.sum_sqrel += ((diff * diff) / (g + self.eps)).sum().item()
+        # ✅ delta metrics
+        ratio = torch.maximum(p / (g + self.eps), g / (p + self.eps))
+        self.sum_d1 += (ratio < 1.25).float().sum()
+        self.sum_d2 += (ratio < (1.25 ** 2)).float().sum()
+        self.sum_d3 += (ratio < (1.25 ** 3)).float().sum()
 
-        self.count += float(g.numel())
+        self.count += torch.tensor([p.numel()], device=self.count.device, dtype=self.count.dtype)
 
     def all_reduce_(self):
         if not (dist.is_available() and dist.is_initialized()):
             return
-        t = torch.tensor([
-            self.sum_abs, self.sum_sq,
-            self.sum_abs_inv, self.sum_sq_inv,
-            self.sum_absrel, self.sum_sqrel,
-            self.count
-        ], device="cuda" if torch.cuda.is_available() else "cpu", dtype=torch.float64)
-        dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        (self.sum_abs, self.sum_sq,
-         self.sum_abs_inv, self.sum_sq_inv,
-         self.sum_absrel, self.sum_sqrel,
-         self.count) = t.tolist()
+        for t in [self.sum_abs, self.sum_sq, self.sum_abs_rel, self.sum_sq_rel,
+                  self.sum_iabs, self.sum_isq, self.count,
+                  self.sum_d1, self.sum_d2, self.sum_d3]:
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
 
-    def compute(self) -> dict:
-        c = max(self.count, 1.0)
-        mae = self.sum_abs / c
-        rmse = (self.sum_sq / c) ** 0.5
-        imae = self.sum_abs_inv / c
-        irmse = (self.sum_sq_inv / c) ** 0.5
-        absrel = self.sum_absrel / c
-        sqrel = self.sum_sqrel / c
-        return {"MAE": mae, "RMSE": rmse, "iMAE": imae, "iRMSE": irmse, "AbsRel": absrel, "SqRel": sqrel}
+    def compute(self):
+        c = torch.clamp(self.count, min=1.0)
+        mae = (self.sum_abs / c).item()
+        rmse = torch.sqrt(self.sum_sq / c).item()
+        absrel = (self.sum_abs_rel / c).item()
+        sqrel = (self.sum_sq_rel / c).item()
+        imae = (self.sum_iabs / c).item()
+        irmse = torch.sqrt(self.sum_isq / c).item()
 
+        d1 = (self.sum_d1 / c).item()
+        d2 = (self.sum_d2 / c).item()
+        d3 = (self.sum_d3 / c).item()
+
+        return {
+            "MAE": mae, "RMSE": rmse, "iMAE": imae, "iRMSE": irmse,
+            "AbsRel": absrel, "SqRel": sqrel,
+            "d1": d1, "d2": d2, "d3": d3,
+        }
 
 def fmt_metrics(m: dict) -> str:
-    return (f"MAE={m['MAE']:.4f}  RMSE={m['RMSE']:.4f}  "
-            f"iMAE={m['iMAE']:.4f}  iRMSE={m['iRMSE']:.4f}  "
-            f"AbsRel={m['AbsRel']:.4f}  SqRel={m['SqRel']:.4f}")
+    # ✅ 把 d1 打出来（你只要求 d1，我也一起把 d2/d3带上，方便对照）
+    return (f"MAE={m['MAE']:.3f}  RMSE={m['RMSE']:.3f}  "
+            f"iMAE={m['iMAE']:.3f}  iRMSE={m['iRMSE']:.3f}  "
+            f"AbsRel={m['AbsRel']:.3f}  SqRel={m['SqRel']:.3f}  "
+            f"d1={m['d1']:.3f}  d2={m['d2']:.3f}  d3={m['d3']:.3f}")

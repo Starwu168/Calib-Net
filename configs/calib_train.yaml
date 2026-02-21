@@ -9,6 +9,8 @@ exp:
 data:
   dataset_class: "datasets.ZJU.ZJU4DRadarCam"
   dataset_kwargs:
+    target_h: 288
+    target_w: 800
     mode: train
     path: "/data00/wsx/data/ZJU-4DRadarCam"
     num_sample: 500
@@ -16,12 +18,12 @@ data:
     num_mask: 1
 
   num_workers: 4
-  train_batch_size: 2
-  val_batch_size: 2
+  train_batch_size: 4
+  val_batch_size: 8
 
 train:
   epochs: 60
-  lr: 2.0e-4
+  lr: 1.0e-4
   weight_decay: 1.0e-4
   log_every: 500
   save_every: 1

@@ -1,5 +1,6 @@
 # main.py
 from __future__ import annotations
+from utils.resume import auto_resume
 import os
 import time
 import argparse
@@ -151,6 +152,9 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True, help="path to yaml config")
+    ap.add_argument("--resume", action="store_true", help="auto resume from runs/<exp.name>/latest epoch ckpt")
+    ap.add_argument("--resume_prefer", type=str, default="latest", choices=["latest", "best"],
+                    help="resume from latest epoch_*.pth or best.pth")
     args = ap.parse_args()
 
     local_rank = setup_ddp()
@@ -223,11 +227,44 @@ def main():
     )
     scaler = GradScaler(enabled=cfg["exp"]["amp"])
 
-    best_rmse = 1e18
     epochs = cfg["train"]["epochs"]
+    start_epoch = 1
+    best_rmse = 1e18
 
-    for epoch in range(1, epochs + 1):
+    # ✅ resume
+    if args.resume:
+        se, loaded_best, ckpt_path = auto_resume(
+            out_dir=out_dir,
+            model=model,              # DDP wrapper ok
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+            prefer=args.resume_prefer,
+        )
+        start_epoch = se
+        if loaded_best is not None:
+            best_rmse = loaded_best
+        if rank == 0:
+            if ckpt_path is None:
+                print("[resume] no checkpoint found, start from scratch.")
+            else:
+                print(f"[resume] loaded: {ckpt_path}")
+                print(f"[resume] start_epoch={start_epoch}, best_rmse={best_rmse}")
+
+    for epoch in range(start_epoch, epochs + 1):
         train_sampler.set_epoch(epoch)
+
+        # ---- manual LR decay: every 10 epochs reduce 1e-5 ----
+        base_lr = cfg["train"]["lr"]
+        decay_steps = (epoch - 1) // 10
+        new_lr = max(base_lr - decay_steps * 1e-5, 1e-7)
+
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = new_lr
+
+        if rank == 0:
+            print(f"[lr] epoch={epoch}  lr={new_lr:.8f}")
+
         if rank == 0:
             print(f"\n===== epoch {epoch}/{epochs} =====")
 
@@ -240,9 +277,8 @@ def main():
         if epoch % cfg["train"]["val_every"] == 0:
             val_meter, val_metrics = validate(model, val_loader, device, cfg, criterion)
 
-            # best by RMSE
             if rank == 0:
-                rmse = val_metrics["RMSE"]
+                rmse = float(val_metrics["RMSE"])
                 is_best = rmse < best_rmse
                 best_rmse = min(best_rmse, rmse)
 
@@ -250,17 +286,18 @@ def main():
                     save_checkpoint(
                         out_dir=out_dir,
                         epoch=epoch,
-                        model=model.module,  # ✅保存真实模型
+                        model=model.module,
                         optimizer=optimizer,
                         scaler=scaler,
                         best=is_best,
-                        extra={"best_rmse": best_rmse}
+                        extra={"best_rmse": best_rmse, "val_rmse": rmse}
                     )
 
     if rank == 0:
         print("[done]")
 
     ddp_cleanup()
+
 
 
 if __name__ == "__main__":
