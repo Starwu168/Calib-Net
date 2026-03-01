@@ -257,7 +257,7 @@ def main():
         # ---- manual LR decay: every 10 epochs reduce 1e-5 ----
         base_lr = cfg["train"]["lr"]
         decay_steps = (epoch - 1) // 10
-        new_lr = max(base_lr - decay_steps * 1e-5, 1e-7)
+        new_lr = max(base_lr - decay_steps * 2e-5, 1e-7)
 
         for param_group in optimizer.param_groups:
             param_group["lr"] = new_lr

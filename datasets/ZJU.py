@@ -72,6 +72,26 @@ def choose_centered_crop_box(H: int, W: int, target_h: int, target_w: int, cx: f
     top = clamp_int(top, 0, H - target_h)
     return top, left
 
+def choose_biased_crop_box(
+    H: int, W: int,
+    target_h: int, target_w: int,
+    cx: float, cy: float,
+    sky_bias_ratio: float = 0.15,
+):
+    """
+    让 crop 窗口整体向下移动，从而裁掉更多天空：
+      sky_bias_ratio > 0  => down_bias = sky_bias_ratio * target_h
+    返回: top, left
+    """
+    down_bias = float(sky_bias_ratio) * float(target_h)
+
+    left = int(round(cx - target_w / 2.0))
+    top  = int(round((cy + down_bias) - target_h / 2.0))
+
+    left = clamp_int(left, 0, W - target_w)
+    top  = clamp_int(top,  0, H - target_h)
+    return top, left
+
 
 def rasterize_radar_to_sparse(
     radar_uvd: np.ndarray,
@@ -148,7 +168,8 @@ class ZJU4DRadarCam(BaseDataset):
         enable_color_aug: bool = True,
         enable_hflip: bool = True,
         target_h: int = 288,
-        target_w: int = 720,
+        target_w: int = 800,
+        sky_bias_ratio: float = 0.30,
         *args, **kwargs
     ):
         super().__init__(path, mode)
@@ -168,6 +189,8 @@ class ZJU4DRadarCam(BaseDataset):
         # ✅ fixed output resolution (train/val/test 都是这个分辨率)
         self.target_h = int(target_h)
         self.target_w = int(target_w)
+
+        self.sky_bias_ratio = float(sky_bias_ratio)
 
         self.base_dir = os.path.join(path, "data")
         txt_path = os.path.join(self.base_dir, f"{mode}.txt")
@@ -256,10 +279,11 @@ class ZJU4DRadarCam(BaseDataset):
         cx0 = float(K[0, 2].item())
         cy0 = float(K[1, 2].item())
 
-        top, left = choose_centered_crop_box(
+        top, left = choose_biased_crop_box(
             H=H, W=W,
             target_h=self.target_h, target_w=self.target_w,
-            cx=cx0, cy=cy0
+            cx=cx0, cy=cy0,
+            sky_bias_ratio=self.sky_bias_ratio,
         )
 
         rgb = TF.crop(rgb, top=top, left=left, height=self.target_h, width=self.target_w)
