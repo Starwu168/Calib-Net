@@ -21,6 +21,14 @@ def _robust_clip(d: np.ndarray):
     return np.clip(d, lo, hi)
 
 
+def _unpack_batch(batch):
+    if len(batch) == 5:
+        rgb, dep_sp, Kcam, dep_interp, dep_sparse = batch
+        return rgb, dep_sp, Kcam, dep_interp, dep_sparse
+    rgb, dep_sp, Kcam, dep = batch
+    return rgb, dep_sp, Kcam, dep, None
+
+
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
@@ -51,33 +59,54 @@ def main():
 
     saved = 0
     for i, batch in enumerate(val_loader):
-        rgb, dep_sp, Kcam, dep = batch
+        rgb, dep_sp, Kcam, dep_interp, dep_sparse = _unpack_batch(batch)
         rgb = rgb.to(device)
         dep_sp = dep_sp.to(device)
         Kcam = Kcam.to(device)
-        dep = dep.to(device)
+        dep_interp = dep_interp.to(device)
+        dep_sparse = dep_sparse.to(device) if dep_sparse is not None else None
 
         pmp_out_list, _s_pred_list, _sprime = model(rgb, dep_sp, Kcam)
         pred = pmp_out_list[-1] if isinstance(pmp_out_list, (list, tuple)) else pmp_out_list
 
-        met.update(pred, dep)
+        if dep_sparse is not None and cfg["loss"].get("metrics_use_sparse_gt", True):
+            eval_tgt = dep_sparse
+            eval_mask = dep_sparse > float(cfg["loss"].get("t_valid", 1e-3))
+        else:
+            eval_tgt = dep_interp
+            eval_mask = None
 
-        gt_np = dep.squeeze().detach().cpu().numpy()
+        met.update(
+            pred,
+            eval_tgt,
+            valid_mask=eval_mask,
+            depth_min=cfg["loss"].get("depth_min", None),
+            depth_max=cfg["loss"].get("depth_max", None),
+        )
+
+        sparse_np = dep_sparse.squeeze().detach().cpu().numpy() if dep_sparse is not None else np.zeros_like(dep_interp.squeeze().detach().cpu().numpy())
+        interp_np = dep_interp.squeeze().detach().cpu().numpy()
         pr_np = pred.squeeze().detach().cpu().numpy()
 
-        gt_vis = _robust_clip(gt_np)
+        sparse_vis = _robust_clip(sparse_np)
+        interp_vis = _robust_clip(interp_np)
         pr_vis = _robust_clip(pr_np)
 
-        fig = plt.figure(figsize=(10, 4))
-        ax1 = fig.add_subplot(1, 2, 1)
-        ax1.imshow(gt_vis, cmap="magma")
-        ax1.set_title("GT")
+        fig = plt.figure(figsize=(15, 4))
+        ax1 = fig.add_subplot(1, 3, 1)
+        ax1.imshow(sparse_vis, cmap="magma")
+        ax1.set_title("Sparse GT")
         ax1.axis("off")
 
-        ax2 = fig.add_subplot(1, 2, 2)
-        ax2.imshow(pr_vis, cmap="magma")
-        ax2.set_title("Pred (Calib+PMP)")
+        ax2 = fig.add_subplot(1, 3, 2)
+        ax2.imshow(interp_vis, cmap="magma")
+        ax2.set_title("GT Interp")
         ax2.axis("off")
+
+        ax3 = fig.add_subplot(1, 3, 3)
+        ax3.imshow(pr_vis, cmap="magma")
+        ax3.set_title("Pred (Calib+PMP)")
+        ax3.axis("off")
 
         fig.tight_layout()
         out_path = os.path.join(args.out_dir, f"vis_{i:05d}.png")

@@ -154,6 +154,7 @@ class ZJU4DRadarCam(BaseDataset):
         image/
         radar/        *.npy (N,3) [u,v,d] in pixel coords of original image
         gt_interp/    *.png 16bit depth
+        gt/           *.png sparse lidar depth
         train.txt val.txt test.txt ...
     """
 
@@ -170,6 +171,8 @@ class ZJU4DRadarCam(BaseDataset):
         target_h: int = 288,
         target_w: int = 800,
         sky_bias_ratio: float = 0.30,
+        sparse_gt_dirname: str = "gt",
+        return_sparse_gt: bool = True,
         *args, **kwargs
     ):
         super().__init__(path, mode)
@@ -191,6 +194,8 @@ class ZJU4DRadarCam(BaseDataset):
         self.target_w = int(target_w)
 
         self.sky_bias_ratio = float(sky_bias_ratio)
+        self.return_sparse_gt = bool(return_sparse_gt)
+        self.sparse_gt_dirname = str(sparse_gt_dirname)
 
         self.base_dir = os.path.join(path, "data")
         txt_path = os.path.join(self.base_dir, f"{mode}.txt")
@@ -216,9 +221,15 @@ class ZJU4DRadarCam(BaseDataset):
             img_path = os.path.join(self.base_dir, "image", f"{pure}.png")
             radar_path = os.path.join(self.base_dir, "radar", f"{pure}.npy")
             gt_path = os.path.join(self.base_dir, "gt_interp", f"{pure}.png")
+            sparse_gt_path = os.path.join(self.base_dir, self.sparse_gt_dirname, f"{pure}.png")
 
             if os.path.exists(img_path) and os.path.exists(radar_path) and os.path.exists(gt_path):
-                self.sample_list.append({"img": img_path, "radar": radar_path, "gt": gt_path})
+                self.sample_list.append({
+                    "img": img_path,
+                    "radar": radar_path,
+                    "gt": gt_path,
+                    "sparse_gt": sparse_gt_path if os.path.exists(sparse_gt_path) else None,
+                })
 
         print(f"[ZJU4DRadarCam] mode={mode}, samples={len(self.sample_list)}")
 
@@ -251,6 +262,10 @@ class ZJU4DRadarCam(BaseDataset):
         # load
         rgb = Image.open(sample["img"]).convert("RGB")
         gt = read_depth_png_16bit(sample["gt"])  # (H,W) meters
+        if sample["sparse_gt"] is not None:
+            sparse_gt = read_depth_png_16bit(sample["sparse_gt"])
+        else:
+            sparse_gt = np.zeros_like(gt, dtype=np.float32)
         radar = np.load(sample["radar"])         # (N,3) [u,v,d] in original pixel coords
 
         H, W = gt.shape
@@ -288,6 +303,7 @@ class ZJU4DRadarCam(BaseDataset):
 
         rgb = TF.crop(rgb, top=top, left=left, height=self.target_h, width=self.target_w)
         gt = gt[top:top + self.target_h, left:left + self.target_w]
+        sparse_gt = sparse_gt[top:top + self.target_h, left:left + self.target_w]
         K = update_K_for_crop(K, left=left, top=top)
 
         # --------------------------
@@ -301,6 +317,7 @@ class ZJU4DRadarCam(BaseDataset):
             target_w=self.target_w,
         )
         dep = gt.astype(np.float32)
+        dep_sparse_gt = sparse_gt.astype(np.float32)
 
         # --------------------------
         # 4) BPNet-style augmentations (train only) with strict K updates
@@ -311,6 +328,7 @@ class ZJU4DRadarCam(BaseDataset):
                 rgb = TF.hflip(rgb)
                 dep = np.ascontiguousarray(np.fliplr(dep))
                 dep_sp = np.ascontiguousarray(np.fliplr(dep_sp))
+                dep_sparse_gt = np.ascontiguousarray(np.fliplr(dep_sparse_gt))
                 # cx' = (W-1) - cx
                 Wc = self.target_w
                 K[0, 2] = (Wc - 1.0) - K[0, 2]
@@ -333,6 +351,10 @@ class ZJU4DRadarCam(BaseDataset):
                 rgb = TF.resize(rgb, size=[new_h, new_w], interpolation=TF.InterpolationMode.BILINEAR)
                 dep = np.array(Image.fromarray(dep).resize((new_w, new_h), resample=Image.NEAREST), dtype=np.float32)
                 dep_sp = np.array(Image.fromarray(dep_sp).resize((new_w, new_h), resample=Image.NEAREST), dtype=np.float32)
+                dep_sparse_gt = np.array(
+                    Image.fromarray(dep_sparse_gt).resize((new_w, new_h), resample=Image.NEAREST),
+                    dtype=np.float32
+                )
 
                 # update K for resize
                 sx = new_w / self.target_w
@@ -346,6 +368,7 @@ class ZJU4DRadarCam(BaseDataset):
                 rgb = TF.crop(rgb, top=top2, left=left2, height=self.target_h, width=self.target_w)
                 dep = dep[top2:top2 + self.target_h, left2:left2 + self.target_w]
                 dep_sp = dep_sp[top2:top2 + self.target_h, left2:left2 + self.target_w]
+                dep_sparse_gt = dep_sparse_gt[top2:top2 + self.target_h, left2:left2 + self.target_w]
 
                 # update K for crop2
                 K = update_K_for_crop(K, left=left2, top=top2)
@@ -357,8 +380,12 @@ class ZJU4DRadarCam(BaseDataset):
 
         dep_sp_t = torch.from_numpy(dep_sp).unsqueeze(0)  # (1,H,W)
         dep_t = torch.from_numpy(dep).unsqueeze(0)        # (1,H,W)
+        dep_sparse_t = torch.from_numpy(dep_sparse_gt).unsqueeze(0)  # (1,H,W)
 
         dep_sp_t = dep_sp_t * self.mul_factor
         dep_t = dep_t * self.mul_factor
+        dep_sparse_t = dep_sparse_t * self.mul_factor
 
+        if self.return_sparse_gt:
+            return rgb_t, dep_sp_t, K, dep_t, dep_sparse_t
         return rgb_t, dep_sp_t, K, dep_t

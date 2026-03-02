@@ -1,4 +1,3 @@
-# configs/calib_pmp_train.yaml
 exp:
   name: calib_pmp_zju
   out_dir: ./runs
@@ -16,6 +15,9 @@ data:
     num_sample: 500
     mul_factor: 1.0
     num_mask: 1
+    return_sparse_gt: true
+    sparse_gt_dirname: "gt"
+    sky_bias_ratio: 0.30
 
   num_workers: 4
   train_batch_size: 4
@@ -31,62 +33,50 @@ train:
   grad_clip_norm: 1.0
 
 model:
-  # 端到端网络：CalibPMPNet 会读取 model.calib 作为 CalibOnlyNet 的 cfg
   calib:
-    # BPNet 是 5 个尺度，这里也做 5 个尺度
     num_scales: 5
-
-    # RGB pyramid encoder通道
     rgb_channels: [32, 64, 96, 128, 160]
-
-    # radar base feature通道
     radar_channels: [16, 24, 32, 40, 48]
+    radar_token_down_ratio: 2
 
-    # “对每一层的 s 做 encoder 下采样到 1/4”的实现
-    radar_token_down_ratio: 2     # 每尺度内部再 /4（你的实现里是down_ratio=2）
-
-    # window SA
     sa:
       window: 5
       heads: 4
       dim_head: 16
       dilation: 2
 
-    # CA（同位置融合）
     ca:
-      out_dim: 64   # CA 后融合维度（会与 radar token concat）
+      out_dim: 64
 
-    # 残差精修
     refine:
       blocks: 2
-      use_channel_attn: true  # SE-like
+      use_channel_attn: true
       se_reduction: 8
 
-  # 预留：如果你以后要把 BP-Net 的 Net 参数也可配置，再往这里加
-  # 当前写死 BP-Net(Pre_MF_Post) 不需要任何参数
   pmp: {}
 
 loss:
-  # ====== 端到端组合权重 ======
-  # total_loss = lambda_calib * calib_loss + lambda_pmp * pmp_loss
   lambda_calib: 1.0
   lambda_pmp: 1.0
 
-  # ====== 深度有效mask阈值（指标与pmp loss 都用它）=====
+  # Shared valid mask settings
   t_valid: 0.001
+  depth_min: 0.0
+  depth_max: 80.0
+  use_sparse_gt_mask: true
+  metrics_use_sparse_gt: true
+  gt_outlier_kernel_size: -1
+  gt_outlier_threshold: 1.5
 
-  # ====== PMP 多尺度监督权重（必须与 BP-Net 输出list长度一致：6个尺度）=====
-  # BP-Net 输出顺序: [pred5_up, pred4_up, pred3_up, pred2_up, pred1_up, pred0]
+  # PMP supervision
   pmp_ms_weights: [0.03, 0.06, 0.12, 0.25, 0.5, 1.0]
+  pmp_sparse_weight: 1.0
 
-  # ====== Calib-only loss 配置（原样搬过来，字段名不改）=====
+  # Calib-only losses
   calib:
-    # 稀疏监督：只在原 dep_sp>0 位置计算 S' vs dep(gt)
     w_sparse: 1.0
-
     w_consistency: 0.3
     w_energy: 0.05
     w_outside: 0.1
-
-    # 多尺度监督权重（从细到粗）
+    use_sparse_gt_mask: true
     ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

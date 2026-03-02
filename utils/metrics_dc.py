@@ -31,7 +31,14 @@ class DCMetrics:
         self.sum_d3 = torch.zeros(1, device=dev)
 
     @torch.no_grad()
-    def update(self, pred: torch.Tensor, gt: torch.Tensor):
+    def update(
+        self,
+        pred: torch.Tensor,
+        gt: torch.Tensor,
+        valid_mask: torch.Tensor | None = None,
+        depth_min: float | None = None,
+        depth_max: float | None = None,
+    ):
         # pred/gt: (B,1,H,W) or (B,H,W)
         if pred.dim() == 3:
             pred = pred.unsqueeze(1)
@@ -39,6 +46,14 @@ class DCMetrics:
             gt = gt.unsqueeze(1)
 
         m = (gt > self.t_valid)
+        if depth_min is not None:
+            m = m & (gt > float(depth_min))
+        if depth_max is not None:
+            m = m & (gt < float(depth_max))
+        if valid_mask is not None:
+            if valid_mask.dim() == 3:
+                valid_mask = valid_mask.unsqueeze(1)
+            m = m & (valid_mask > 0)
         if m.sum() == 0:
             return
 

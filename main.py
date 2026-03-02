@@ -1,7 +1,5 @@
-# main.py
 from __future__ import annotations
 from utils.resume import auto_resume
-import os
 import time
 import argparse
 from pathlib import Path
@@ -19,7 +17,6 @@ from utils.seed import set_seed
 from utils.checkpoint import save_checkpoint
 from utils.meters import AvgMeter
 from datasets.builder import build_dataset
-
 from models.calib_pmp_net import CalibPMPNet
 from train.criteria_total import TotalCriterion
 from utils.metrics_dc import DCMetrics, fmt_metrics
@@ -28,6 +25,25 @@ from utils.ddp import setup_ddp, ddp_cleanup
 
 def _final_pred(pmp_out_list):
     return pmp_out_list[-1] if isinstance(pmp_out_list, (list, tuple)) else pmp_out_list
+
+
+def _unpack_batch(batch):
+    if len(batch) == 5:
+        rgb, dep_sp, Kcam, dep, dep_sparse = batch
+        return rgb, dep_sp, Kcam, dep, dep_sparse
+    rgb, dep_sp, Kcam, dep = batch
+    return rgb, dep_sp, Kcam, dep, None
+
+
+def _eval_target_and_mask(dep_dense, dep_sparse, cfg_loss: dict):
+    use_sparse_eval = bool(cfg_loss.get("metrics_use_sparse_gt", True))
+    use_sparse_mask = bool(cfg_loss.get("use_sparse_gt_mask", True))
+
+    target = dep_sparse if (dep_sparse is not None and use_sparse_eval) else dep_dense
+    valid_mask = None
+    if dep_sparse is not None and use_sparse_mask:
+        valid_mask = dep_sparse > float(cfg_loss.get("t_valid", 1e-3))
+    return target, valid_mask
 
 
 def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criterion: TotalCriterion):
@@ -44,18 +60,18 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
         total=len(loader),
         dynamic_ncols=True,
         desc=f"train e{epoch}",
-        disable=(rank != 0)
+        disable=(rank != 0),
     )
 
-    # epoch metrics (train)
     met = DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
 
     for step, batch in enumerate(pbar):
-        rgb, dep_sp, Kcam, dep = batch
+        rgb, dep_sp, Kcam, dep, dep_sparse = _unpack_batch(batch)
         rgb = rgb.to(device, non_blocking=True)
         dep_sp = dep_sp.to(device, non_blocking=True)
-        Kcam = Kcam.to(device, non_blocking=True)   # ✅必须
+        Kcam = Kcam.to(device, non_blocking=True)
         dep = dep.to(device, non_blocking=True)
+        dep_sparse = dep_sparse.to(device, non_blocking=True) if dep_sparse is not None else None
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -66,7 +82,8 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
                 s_pred_list=s_pred_list,
                 dep_sp=dep_sp,
                 dep_gt=dep,
-                cfg_loss_calib=cfg["loss"]["calib"],   # ✅原 calib loss 配置放这里
+                dep_sparse_gt=dep_sparse,
+                cfg_loss_calib=cfg["loss"]["calib"],
             )
 
         scaler.scale(loss).backward()
@@ -81,15 +98,19 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
         elapsed = time.time() - start_time
         meter.update(loss=float(loss.detach().cpu()), n=rgb.size(0), parts=parts)
 
-        # metrics on final dense prediction
         pred = _final_pred(pmp_out_list)
-        met.update(pred, dep)
+        eval_tgt, eval_mask = _eval_target_and_mask(dep, dep_sparse, cfg["loss"])
+        met.update(
+            pred,
+            eval_tgt,
+            valid_mask=eval_mask,
+            depth_min=cfg["loss"].get("depth_min", None),
+            depth_max=cfg["loss"].get("depth_max", None),
+        )
 
         pbar.set_postfix({"time": f"{elapsed/60:.1f}m"})
 
-        # 原有print保留（只rank0）
         if rank == 0 and (step + 1) % log_every == 0:
-            # 这里 parts 里仍包含 calib 的 sparse/consis/energy，同时包含 loss_pmp
             print(
                 f"[train] step={step+1}/{len(loader)} "
                 f"loss={meter.avg('loss'):.6f} "
@@ -97,10 +118,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
                 f"pmp={meter.avg('loss_pmp'):.6f} "
                 f"sparse={meter.avg('loss_sparse'):.6f} "
                 f"consis={meter.avg('loss_consis'):.6f} "
-                f"energy={meter.avg('loss_energy'):.6f}"
+                f"energy={meter.avg('loss_energy'):.6f} "
+                f"outside={meter.avg('loss_outside'):.6f}"
             )
 
-    # DDP: reduce metrics
     met.all_reduce_()
     return meter, met.compute()
 
@@ -110,15 +131,15 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
     model.eval()
     meter = AvgMeter()
     rank = dist.get_rank() if dist.is_initialized() else 0
-
     met = DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
 
     for batch in loader:
-        rgb, dep_sp, Kcam, dep = batch
+        rgb, dep_sp, Kcam, dep, dep_sparse = _unpack_batch(batch)
         rgb = rgb.to(device, non_blocking=True)
         dep_sp = dep_sp.to(device, non_blocking=True)
-        Kcam = Kcam.to(device, non_blocking=True)   # ✅必须
+        Kcam = Kcam.to(device, non_blocking=True)
         dep = dep.to(device, non_blocking=True)
+        dep_sparse = dep_sparse.to(device, non_blocking=True) if dep_sparse is not None else None
 
         with autocast(enabled=cfg["exp"]["amp"]):
             pmp_out_list, s_pred_list, _sprime = model(rgb, dep_sp, Kcam)
@@ -127,13 +148,21 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
                 s_pred_list=s_pred_list,
                 dep_sp=dep_sp,
                 dep_gt=dep,
+                dep_sparse_gt=dep_sparse,
                 cfg_loss_calib=cfg["loss"]["calib"],
             )
 
         meter.update(loss=float(loss.detach().cpu()), n=rgb.size(0), parts=parts)
 
         pred = _final_pred(pmp_out_list)
-        met.update(pred, dep)
+        eval_tgt, eval_mask = _eval_target_and_mask(dep, dep_sparse, cfg["loss"])
+        met.update(
+            pred,
+            eval_tgt,
+            valid_mask=eval_mask,
+            depth_min=cfg["loss"].get("depth_min", None),
+            depth_max=cfg["loss"].get("depth_max", None),
+        )
 
     met.all_reduce_()
     m = met.compute()
@@ -152,9 +181,18 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, required=True, help="path to yaml config")
-    ap.add_argument("--resume", action="store_true", help="auto resume from runs/<exp.name>/latest epoch ckpt")
-    ap.add_argument("--resume_prefer", type=str, default="latest", choices=["latest", "best"],
-                    help="resume from latest epoch_*.pth or best.pth")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="auto resume from runs/<exp.name>/latest epoch ckpt",
+    )
+    ap.add_argument(
+        "--resume_prefer",
+        type=str,
+        default="latest",
+        choices=["latest", "best"],
+        help="resume from latest epoch_*.pth or best.pth",
+    )
     args = ap.parse_args()
 
     local_rank = setup_ddp()
@@ -178,9 +216,10 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[info] out_dir={out_dir}")
 
-    # dataset
-    train_kwargs = dict(cfg["data"]["dataset_kwargs"]); train_kwargs["mode"] = "train"
-    val_kwargs = dict(cfg["data"]["dataset_kwargs"]); val_kwargs["mode"] = "val"
+    train_kwargs = dict(cfg["data"]["dataset_kwargs"])
+    train_kwargs["mode"] = "train"
+    val_kwargs = dict(cfg["data"]["dataset_kwargs"])
+    val_kwargs["mode"] = "val"
     train_ds = build_dataset(cfg["data"]["dataset_class"], train_kwargs)
     val_ds = build_dataset(cfg["data"]["dataset_class"], val_kwargs)
 
@@ -207,7 +246,6 @@ def main():
         prefetch_factor=4 if cfg["data"]["num_workers"] > 0 else None,
     )
 
-    # model
     model = CalibPMPNet(cfg["model"]).to(device)
     model = DDP(
         model,
@@ -217,13 +255,12 @@ def main():
         find_unused_parameters=False,
     )
 
-    # criterion
     criterion = TotalCriterion(cfg["loss"]).to(device)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["train"]["lr"],
-        weight_decay=cfg["train"]["weight_decay"]
+        weight_decay=cfg["train"]["weight_decay"],
     )
     scaler = GradScaler(enabled=cfg["exp"]["amp"])
 
@@ -231,11 +268,10 @@ def main():
     start_epoch = 1
     best_rmse = 1e18
 
-    # ✅ resume
     if args.resume:
         se, loaded_best, ckpt_path = auto_resume(
             out_dir=out_dir,
-            model=model,              # DDP wrapper ok
+            model=model,
             optimizer=optimizer,
             scaler=scaler,
             device=device,
@@ -254,23 +290,19 @@ def main():
     for epoch in range(start_epoch, epochs + 1):
         train_sampler.set_epoch(epoch)
 
-        # ---- manual LR decay: every 10 epochs reduce 1e-5 ----
         base_lr = cfg["train"]["lr"]
         decay_steps = (epoch - 1) // 10
         new_lr = max(base_lr - decay_steps * 2e-5, 1e-7)
-
         for param_group in optimizer.param_groups:
             param_group["lr"] = new_lr
 
         if rank == 0:
             print(f"[lr] epoch={epoch}  lr={new_lr:.8f}")
-
-        if rank == 0:
             print(f"\n===== epoch {epoch}/{epochs} =====")
 
-        train_meter, train_metrics = train_one_epoch(model, train_loader, optimizer, scaler, device, cfg, epoch, criterion)
-
-        # epoch end: print metrics (rank0 only)
+        train_meter, train_metrics = train_one_epoch(
+            model, train_loader, optimizer, scaler, device, cfg, epoch, criterion
+        )
         if rank == 0:
             print(f"[train] metrics: {fmt_metrics(train_metrics)}")
 
@@ -290,14 +322,13 @@ def main():
                         optimizer=optimizer,
                         scaler=scaler,
                         best=is_best,
-                        extra={"best_rmse": best_rmse, "val_rmse": rmse}
+                        extra={"best_rmse": best_rmse, "val_rmse": rmse},
                     )
 
     if rank == 0:
         print("[done]")
 
     ddp_cleanup()
-
 
 
 if __name__ == "__main__":
