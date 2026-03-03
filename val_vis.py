@@ -22,19 +22,21 @@ def _robust_clip(d: np.ndarray):
 
 
 def _unpack_batch(batch):
-    if len(batch) == 5:
-        rgb, dep_sp, Kcam, dep_interp, dep_sparse = batch
-        return rgb, dep_sp, Kcam, dep_interp, dep_sparse
-    rgb, dep_sp, Kcam, dep = batch
-    return rgb, dep_sp, Kcam, dep, None
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    if len(batch) < 4:
+        raise ValueError(f"Batch must contain at least 4 items, got {len(batch)}")
+    rgb, dep_sp, Kcam, dep_interp = batch[:4]
+    dep_sparse = batch[4] if len(batch) >= 5 else None
+    return rgb, dep_sp, Kcam, dep_interp, dep_sparse
 
 
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", type=str, required=True)
-    ap.add_argument("--ckpt", type=str, required=True)
-    ap.add_argument("--out_dir", type=str, default="./vis_out")
+    ap.add_argument("--config", type=str, default="/data00/wsx/code/calibnet/configs/calib_train.yaml")
+    ap.add_argument("--ckpt", type=str, default="/data00/wsx/code/calibnet/runs/calib_pmp_zju/best.pth")
+    ap.add_argument("--out_dir", type=str, default="/data00/wsx/code/calibnet/vis_out")
     ap.add_argument("--num", type=int, default=50)
     args = ap.parse_args()
 

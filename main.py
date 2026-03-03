@@ -28,11 +28,13 @@ def _final_pred(pmp_out_list):
 
 
 def _unpack_batch(batch):
-    if len(batch) == 5:
-        rgb, dep_sp, Kcam, dep, dep_sparse = batch
-        return rgb, dep_sp, Kcam, dep, dep_sparse
-    rgb, dep_sp, Kcam, dep = batch
-    return rgb, dep_sp, Kcam, dep, None
+    if not isinstance(batch, (list, tuple)):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    if len(batch) < 4:
+        raise ValueError(f"Batch must contain at least 4 items, got {len(batch)}")
+    rgb, dep_sp, Kcam, dep = batch[:4]
+    dep_sparse = batch[4] if len(batch) >= 5 else None
+    return rgb, dep_sp, Kcam, dep, dep_sparse
 
 
 def _eval_target_and_mask(dep_dense, dep_sparse, cfg_loss: dict):
@@ -213,8 +215,13 @@ def main():
 
     out_dir = Path(cfg["exp"]["out_dir"]) / cfg["exp"]["name"]
     if rank == 0:
+        cwd = Path.cwd().resolve()
+        cfg_path = Path(args.config).resolve()
+        out_dir_abs = out_dir.resolve()
+        print(f"[info] cwd={cwd}")
+        print(f"[info] config={cfg_path}")
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[info] out_dir={out_dir}")
+        print(f"[info] out_dir={out_dir} (abs={out_dir_abs})")
 
     train_kwargs = dict(cfg["data"]["dataset_kwargs"])
     train_kwargs["mode"] = "train"

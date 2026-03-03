@@ -170,7 +170,7 @@ class ZJU4DRadarCam(BaseDataset):
         enable_hflip: bool = True,
         target_h: int = 288,
         target_w: int = 800,
-        sky_bias_ratio: float = 0.30,
+        sky_bias_ratio: float = 0.05,
         sparse_gt_dirname: str = "gt",
         return_sparse_gt: bool = True,
         *args, **kwargs

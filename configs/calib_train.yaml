@@ -1,6 +1,6 @@
 exp:
   name: calib_pmp_zju
-  out_dir: ./runs
+  out_dir: /data00/wsx/code/calibnet/runs
   seed: 123
   device: cuda
   amp: true
