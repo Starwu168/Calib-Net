@@ -9,6 +9,7 @@ from torch.cuda.amp import autocast, GradScaler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
@@ -46,6 +47,52 @@ def _eval_target_and_mask(dep_dense, dep_sparse, cfg_loss: dict):
     if dep_sparse is not None and use_sparse_mask:
         valid_mask = dep_sparse > float(cfg_loss.get("t_valid", 1e-3))
     return target, valid_mask
+
+
+def _normalize_split_spec(
+    split_spec: str,
+    *,
+    allow_plus: bool,
+    allowed_modes: set[str],
+) -> list[str]:
+    if not isinstance(split_spec, str):
+        raise TypeError(f"split spec must be str, got {type(split_spec)}")
+
+    s = split_spec.strip().lower()
+    if allow_plus and "+" in s:
+        parts = [x.strip() for x in s.split("+") if x.strip()]
+    else:
+        parts = [s]
+
+    if not parts or any(p not in allowed_modes for p in parts):
+        raise ValueError(
+            f"invalid split spec: '{split_spec}', expected subset of {sorted(allowed_modes)}"
+        )
+    return parts
+
+
+def _build_dataset_by_split(
+    dataset_class: str,
+    dataset_kwargs: dict,
+    split_spec: str,
+    *,
+    allow_plus: bool,
+    allowed_modes: set[str],
+):
+    modes = _normalize_split_spec(
+        split_spec,
+        allow_plus=allow_plus,
+        allowed_modes=allowed_modes,
+    )
+    ds_list = []
+    for m in modes:
+        kw = dict(dataset_kwargs)
+        kw["mode"] = m
+        ds_list.append(build_dataset(dataset_class, kw))
+
+    if len(ds_list) == 1:
+        return ds_list[0], modes
+    return ConcatDataset(ds_list), modes
 
 
 def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criterion: TotalCriterion):
@@ -223,12 +270,27 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[info] out_dir={out_dir} (abs={out_dir_abs})")
 
-    train_kwargs = dict(cfg["data"]["dataset_kwargs"])
-    train_kwargs["mode"] = "train"
-    val_kwargs = dict(cfg["data"]["dataset_kwargs"])
-    val_kwargs["mode"] = "val"
-    train_ds = build_dataset(cfg["data"]["dataset_class"], train_kwargs)
-    val_ds = build_dataset(cfg["data"]["dataset_class"], val_kwargs)
+    train_split = cfg["data"].get("train_split", "train")
+    val_split = cfg["data"].get("val_split", "val")
+
+    train_ds, train_modes = _build_dataset_by_split(
+        cfg["data"]["dataset_class"],
+        cfg["data"]["dataset_kwargs"],
+        train_split,
+        allow_plus=True,
+        allowed_modes={"train", "val"},
+    )
+    val_ds, val_modes = _build_dataset_by_split(
+        cfg["data"]["dataset_class"],
+        cfg["data"]["dataset_kwargs"],
+        val_split,
+        allow_plus=False,
+        allowed_modes={"val", "test"},
+    )
+
+    if rank == 0:
+        print(f"[data] train_split={train_split} -> modes={train_modes}, size={len(train_ds)}")
+        print(f"[data] val_split={val_split} -> modes={val_modes}, size={len(val_ds)}")
 
     train_sampler = DistributedSampler(train_ds, shuffle=True, drop_last=True)
     val_sampler = DistributedSampler(val_ds, shuffle=False, drop_last=False)

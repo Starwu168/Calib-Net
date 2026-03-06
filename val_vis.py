@@ -38,18 +38,25 @@ def main():
     ap.add_argument("--ckpt", type=str, default="/data00/wsx/code/calibnet/runs/calib_pmp_zju/best.pth")
     ap.add_argument("--out_dir", type=str, default="/data00/wsx/code/calibnet/vis_out")
     ap.add_argument("--num", type=int, default=50)
+    ap.add_argument(
+        "--depth_max_list",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Evaluate metrics for multiple depth_max values in one run, e.g. --depth_max_list 50 70 80",
+    )
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
     device = torch.device(cfg["exp"]["device"] if torch.cuda.is_available() else "cpu")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # dataset
-    val_kwargs = dict(cfg["data"]["dataset_kwargs"]); val_kwargs["mode"] = "val"
-    val_ds = build_dataset(cfg["data"]["dataset_class"], val_kwargs)
+    # dataset (fixed to official test split)
+    test_kwargs = dict(cfg["data"]["dataset_kwargs"]); test_kwargs["mode"] = "test"
+    test_ds = build_dataset(cfg["data"]["dataset_class"], test_kwargs)
 
     from torch.utils.data import DataLoader
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
     # model
     model = CalibPMPNet(cfg["model"]).to(device)
@@ -57,10 +64,18 @@ def main():
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
 
-    met = DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
+    if args.depth_max_list:
+        depth_max_list = [float(x) for x in args.depth_max_list]
+    else:
+        depth_max_list = [cfg["loss"].get("depth_max", None)]
+
+    metrics_map = {
+        dm: DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
+        for dm in depth_max_list
+    }
 
     saved = 0
-    for i, batch in enumerate(val_loader):
+    for i, batch in enumerate(test_loader):
         rgb, dep_sp, Kcam, dep_interp, dep_sparse = _unpack_batch(batch)
         rgb = rgb.to(device)
         dep_sp = dep_sp.to(device)
@@ -78,13 +93,14 @@ def main():
             eval_tgt = dep_interp
             eval_mask = None
 
-        met.update(
-            pred,
-            eval_tgt,
-            valid_mask=eval_mask,
-            depth_min=cfg["loss"].get("depth_min", None),
-            depth_max=cfg["loss"].get("depth_max", None),
-        )
+        for depth_max, met in metrics_map.items():
+            met.update(
+                pred,
+                eval_tgt,
+                valid_mask=eval_mask,
+                depth_min=cfg["loss"].get("depth_min", None),
+                depth_max=depth_max,
+            )
 
         sparse_np = dep_sparse.squeeze().detach().cpu().numpy() if dep_sparse is not None else np.zeros_like(dep_interp.squeeze().detach().cpu().numpy())
         interp_np = dep_interp.squeeze().detach().cpu().numpy()
@@ -119,8 +135,9 @@ def main():
         if saved >= args.num:
             break
 
-    m = met.compute()
-    print(f"[val_vis] {fmt_metrics(m)}")
+    for depth_max, met in metrics_map.items():
+        m = met.compute()
+        print(f"[val_vis][depth_max={depth_max}] {fmt_metrics(m)}")
     print(f"[done] saved {saved} images to {args.out_dir}")
 
 

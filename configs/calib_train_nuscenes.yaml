@@ -1,6 +1,6 @@
 exp:
-  name: calib_pmp_zju
-  out_dir: /data00/wsx/code/calibnet/runs_ZJU4DRadarCam
+  name: calib_pmp_nuscenes
+  out_dir: /data00/wsx/code/calibnet/runs_nuscenes
   seed: 123
   device: cuda
   amp: true
@@ -10,12 +10,12 @@ data:
   train_split: "train+val"
   # val or test
   val_split: "test"
-  dataset_class: "datasets.ZJU.ZJU4DRadarCam"
+  dataset_class: "datasets.NuScenes.NuScenesCalib"
   dataset_kwargs:
     target_h: 288
     target_w: 864
     mode: train
-    path: "/data00/wsx/data/ZJU-4DRadarCam"
+    path: "/data00/wsx/data/nuscenes_calibnet"
     num_sample: 500
     mul_factor: 1.0
     num_mask: 1
@@ -31,7 +31,7 @@ train:
   epochs: 50
   lr: 2.0e-4
   weight_decay: 1.0e-4
-  log_every: 500
+  log_every: 200
   save_every: 1
   val_every: 1
   grad_clip_norm: 1.0
@@ -63,7 +63,6 @@ loss:
   lambda_calib: 1.0
   lambda_pmp: 1.0
 
-  # Shared valid mask settings
   t_valid: 0.001
   depth_min: 0.0
   depth_max: 80.0
@@ -72,11 +71,9 @@ loss:
   gt_outlier_kernel_size: -1
   gt_outlier_threshold: 1.5
 
-  # PMP supervision
   pmp_ms_weights: [0.03, 0.06, 0.12, 0.25, 0.5, 1.0]
   pmp_sparse_weight: 1.0
 
-  # Calib-only losses
   calib:
     w_sparse: 1.0
     w_consistency: 0.3
