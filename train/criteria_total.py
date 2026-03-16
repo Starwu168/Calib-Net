@@ -25,6 +25,7 @@ class TotalCriterion(nn.Module):
             depth_min=cfg_loss.get("depth_min", None),
             depth_max=cfg_loss.get("depth_max", None),
             sparse_lidar_weight=float(cfg_loss.get("pmp_sparse_weight", 0.0)),
+            l2_weight=float(cfg_loss.get("pmp_l2_weight", 0.0)),
             gt_outlier_kernel_size=int(cfg_loss.get("gt_outlier_kernel_size", -1)),
             gt_outlier_threshold=float(cfg_loss.get("gt_outlier_threshold", -1.0)),
         )

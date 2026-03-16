@@ -22,6 +22,7 @@ from models.calib_pmp_net import CalibPMPNet
 from train.criteria_total import TotalCriterion
 from utils.metrics_dc import DCMetrics, fmt_metrics
 from utils.ddp import setup_ddp, ddp_cleanup
+from wandb_module import WandbLogger
 
 
 def _final_pred(pmp_out_list):
@@ -39,13 +40,28 @@ def _unpack_batch(batch):
 
 
 def _eval_target_and_mask(dep_dense, dep_sparse, cfg_loss: dict):
-    use_sparse_eval = bool(cfg_loss.get("metrics_use_sparse_gt", True))
-    use_sparse_mask = bool(cfg_loss.get("use_sparse_gt_mask", True))
+    metrics_target = str(cfg_loss.get("metrics_target", "")).strip().lower()
+    if metrics_target:
+        use_sparse_eval = metrics_target == "sparse"
+    else:
+        use_sparse_eval = bool(cfg_loss.get("metrics_use_sparse_gt", True))
 
+    mask_source = str(cfg_loss.get("metrics_mask_source", "target")).strip().lower()
     target = dep_sparse if (dep_sparse is not None and use_sparse_eval) else dep_dense
     valid_mask = None
-    if dep_sparse is not None and use_sparse_mask:
+
+    if mask_source == "none":
+        valid_mask = None
+    elif mask_source == "sparse" and dep_sparse is not None:
         valid_mask = dep_sparse > float(cfg_loss.get("t_valid", 1e-3))
+    elif mask_source == "dense":
+        valid_mask = dep_dense > float(cfg_loss.get("t_valid", 1e-3))
+    elif mask_source == "target":
+        valid_mask = target > float(cfg_loss.get("t_valid", 1e-3))
+    else:
+        use_sparse_mask = bool(cfg_loss.get("use_sparse_gt_mask", True))
+        if dep_sparse is not None and use_sparse_mask:
+            valid_mask = dep_sparse > float(cfg_loss.get("t_valid", 1e-3))
     return target, valid_mask
 
 
@@ -95,7 +111,18 @@ def _build_dataset_by_split(
     return ConcatDataset(ds_list), modes
 
 
-def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criterion: TotalCriterion):
+def train_one_epoch(
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    cfg,
+    epoch,
+    criterion: TotalCriterion,
+    wb: WandbLogger | None = None,
+    step_offset: int = 0,
+):
     model.train()
     meter = AvgMeter()
     start_time = time.time()
@@ -112,7 +139,10 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
         disable=(rank != 0),
     )
 
-    met = DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
+    met = DCMetrics(
+        t_valid=cfg["loss"].get("t_valid", 1e-3),
+        protocol=cfg["loss"].get("metrics_protocol", "dc"),
+    )
 
     for step, batch in enumerate(pbar):
         rgb, dep_sp, Kcam, dep, dep_sparse = _unpack_batch(batch)
@@ -168,8 +198,25 @@ def train_one_epoch(model, loader, optimizer, scaler, device, cfg, epoch, criter
                 f"sparse={meter.avg('loss_sparse'):.6f} "
                 f"consis={meter.avg('loss_consis'):.6f} "
                 f"energy={meter.avg('loss_energy'):.6f} "
-                f"outside={meter.avg('loss_outside'):.6f}"
+                f"outside={meter.avg('loss_outside'):.6f} "
+                f"pmp_l2={meter.avg('loss_pmp_l2'):.6f}"
             )
+            if wb is not None and wb.is_active:
+                global_step = step_offset + step + 1
+                wb.log(
+                    {
+                        "epoch": epoch,
+                        "train/iter_loss": meter.avg("loss"),
+                        "train/iter_loss_calib": meter.avg("loss_calib"),
+                        "train/iter_loss_pmp": meter.avg("loss_pmp"),
+                        "train/iter_loss_sparse": meter.avg("loss_sparse"),
+                        "train/iter_loss_consis": meter.avg("loss_consis"),
+                        "train/iter_loss_energy": meter.avg("loss_energy"),
+                        "train/iter_loss_outside": meter.avg("loss_outside"),
+                        "train/iter_loss_pmp_l2": meter.avg("loss_pmp_l2"),
+                    },
+                    step=global_step,
+                )
 
     met.all_reduce_()
     return meter, met.compute()
@@ -180,7 +227,10 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
     model.eval()
     meter = AvgMeter()
     rank = dist.get_rank() if dist.is_initialized() else 0
-    met = DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
+    met = DCMetrics(
+        t_valid=cfg["loss"].get("t_valid", 1e-3),
+        protocol=cfg["loss"].get("metrics_protocol", "dc"),
+    )
 
     for batch in loader:
         rgb, dep_sp, Kcam, dep, dep_sparse = _unpack_batch(batch)
@@ -242,6 +292,12 @@ def main():
         choices=["latest", "best"],
         help="resume from latest epoch_*.pth or best.pth",
     )
+    ap.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default=None,
+        help="resume from an explicit checkpoint path; overrides --resume_prefer",
+    )
     args = ap.parse_args()
 
     local_rank = setup_ddp()
@@ -269,6 +325,7 @@ def main():
         print(f"[info] config={cfg_path}")
         out_dir.mkdir(parents=True, exist_ok=True)
         print(f"[info] out_dir={out_dir} (abs={out_dir_abs})")
+    wb = WandbLogger(cfg=cfg, out_dir=out_dir, rank=rank)
 
     train_split = cfg["data"].get("train_split", "train")
     val_split = cfg["data"].get("val_split", "val")
@@ -325,6 +382,8 @@ def main():
     )
 
     criterion = TotalCriterion(cfg["loss"]).to(device)
+    if rank == 0 and wb.is_active:
+        wb.watch_model(model.module, log_freq=max(1, int(cfg["train"].get("log_every", 200))))
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -337,7 +396,7 @@ def main():
     start_epoch = 1
     best_rmse = 1e18
 
-    if args.resume:
+    if args.resume or args.resume_ckpt is not None:
         se, loaded_best, ckpt_path = auto_resume(
             out_dir=out_dir,
             model=model,
@@ -345,6 +404,7 @@ def main():
             scaler=scaler,
             device=device,
             prefer=args.resume_prefer,
+            ckpt_path=args.resume_ckpt,
         )
         start_epoch = se
         if loaded_best is not None:
@@ -370,10 +430,45 @@ def main():
             print(f"\n===== epoch {epoch}/{epochs} =====")
 
         train_meter, train_metrics = train_one_epoch(
-            model, train_loader, optimizer, scaler, device, cfg, epoch, criterion
+            model,
+            train_loader,
+            optimizer,
+            scaler,
+            device,
+            cfg,
+            epoch,
+            criterion,
+            wb=wb,
+            step_offset=(epoch - 1) * len(train_loader),
         )
         if rank == 0:
             print(f"[train] metrics: {fmt_metrics(train_metrics)}")
+            if wb.is_active:
+                epoch_end_step = epoch * len(train_loader)
+                wb.log(
+                    {
+                        "epoch": epoch,
+                        "train/lr": new_lr,
+                        "train/loss": train_meter.avg("loss"),
+                        "train/loss_calib": train_meter.avg("loss_calib"),
+                        "train/loss_pmp": train_meter.avg("loss_pmp"),
+                        "train/loss_sparse": train_meter.avg("loss_sparse"),
+                        "train/loss_consis": train_meter.avg("loss_consis"),
+                        "train/loss_energy": train_meter.avg("loss_energy"),
+                        "train/loss_outside": train_meter.avg("loss_outside"),
+                        "train/loss_pmp_l2": train_meter.avg("loss_pmp_l2"),
+                        "train/MAE": train_metrics["MAE"],
+                        "train/RMSE": train_metrics["RMSE"],
+                        "train/iMAE": train_metrics["iMAE"],
+                        "train/iRMSE": train_metrics["iRMSE"],
+                        "train/AbsRel": train_metrics["AbsRel"],
+                        "train/SqRel": train_metrics["SqRel"],
+                        "train/d1": train_metrics["d1"],
+                        "train/d2": train_metrics["d2"],
+                        "train/d3": train_metrics["d3"],
+                    },
+                    step=epoch_end_step,
+                )
 
         if epoch % cfg["train"]["val_every"] == 0:
             val_meter, val_metrics = validate(model, val_loader, device, cfg, criterion)
@@ -382,6 +477,28 @@ def main():
                 rmse = float(val_metrics["RMSE"])
                 is_best = rmse < best_rmse
                 best_rmse = min(best_rmse, rmse)
+                if wb.is_active:
+                    epoch_end_step = epoch * len(train_loader)
+                    wb.log(
+                        {
+                            "epoch": epoch,
+                            "val/loss": val_meter.avg("loss"),
+                            "val/loss_calib": val_meter.avg("loss_calib"),
+                            "val/loss_pmp": val_meter.avg("loss_pmp"),
+                            "val/loss_pmp_l2": val_meter.avg("loss_pmp_l2"),
+                            "val/MAE": val_metrics["MAE"],
+                            "val/RMSE": val_metrics["RMSE"],
+                            "val/iMAE": val_metrics["iMAE"],
+                            "val/iRMSE": val_metrics["iRMSE"],
+                            "val/AbsRel": val_metrics["AbsRel"],
+                            "val/SqRel": val_metrics["SqRel"],
+                            "val/d1": val_metrics["d1"],
+                            "val/d2": val_metrics["d2"],
+                            "val/d3": val_metrics["d3"],
+                            "val/best_rmse": best_rmse,
+                        },
+                        step=epoch_end_step,
+                    )
 
                 if epoch % cfg["train"]["save_every"] == 0 or is_best:
                     save_checkpoint(
@@ -396,6 +513,7 @@ def main():
 
     if rank == 0:
         print("[done]")
+        wb.finish()
 
     ddp_cleanup()
 

@@ -5,10 +5,19 @@ exp:
   device: cuda
   amp: true
 
+wandb:
+  enabled: false
+  project: calib-net
+  entity: xuanwu168-beijing-jiaotong-university
+  run_name: calib_pmp_zju_ddp2
+  tags: ["zju", "ddp"]
+  notes: "nohup run"
+  mode: online
+
 data:
-  # train or train+val
-  train_split: "train+val"
-  # val or test
+  # official ZJU split
+  train_split: "train"
+  # report on test like RadarCam-Depth / TacoDepth
   val_split: "test"
   dataset_class: "datasets.ZJU.ZJU4DRadarCam"
   dataset_kwargs:
@@ -28,7 +37,7 @@ data:
   val_batch_size: 8
 
 train:
-  epochs: 50
+  epochs: 70
   lr: 2.0e-4
   weight_decay: 1.0e-4
   log_every: 500
@@ -63,24 +72,32 @@ loss:
   lambda_calib: 1.0
   lambda_pmp: 1.0
 
-  # Shared valid mask settings
+  # RadarCam-Depth style protocol on ZJU:
+  # - keep dense / interpolated LiDAR as the primary training supervision
+  # - evaluate on sparse LiDAR with RadarCam-Depth metric units
   t_valid: 0.001
   depth_min: 0.0
   depth_max: 80.0
-  use_sparse_gt_mask: true
+  use_sparse_gt_mask: false
   metrics_use_sparse_gt: true
+  metrics_target: "sparse"
+  metrics_mask_source: "sparse"
+  metrics_protocol: "radarcam"
   gt_outlier_kernel_size: -1
   gt_outlier_threshold: 1.5
 
   # PMP supervision
   pmp_ms_weights: [0.03, 0.06, 0.12, 0.25, 0.5, 1.0]
   pmp_sparse_weight: 1.0
+  pmp_l2_weight: 0.00
 
   # Calib-only losses
   calib:
+    target_source: "dense"
+    valid_mask_source: "dense"
     w_sparse: 1.0
     w_consistency: 0.3
     w_energy: 0.05
     w_outside: 0.1
-    use_sparse_gt_mask: true
+    use_sparse_gt_mask: false
     ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

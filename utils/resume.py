@@ -59,6 +59,7 @@ def auto_resume(
     scaler: torch.cuda.amp.GradScaler | None,
     device: torch.device,
     prefer: str = "latest",  # "latest" or "best"
+    ckpt_path: str | Path | None = None,
 ) -> tuple[int, float | None, str | None]:
     """
     Load model/optim/scaler from checkpoint in out_dir.
@@ -72,17 +73,20 @@ def auto_resume(
 
     # rank0 selects path
     if is_main_process():
-        ckpt_path: Path | None = None
-        if prefer == "best":
+        selected_ckpt: Path | None = None
+        if ckpt_path is not None:
+            p = Path(ckpt_path)
+            selected_ckpt = p if p.exists() else None
+        elif prefer == "best":
             p = out_dir / "best.pth"
-            ckpt_path = p if p.exists() else None
+            selected_ckpt = p if p.exists() else None
         else:
-            ckpt_path = _find_latest_epoch_ckpt(out_dir)
-            if ckpt_path is None:
+            selected_ckpt = _find_latest_epoch_ckpt(out_dir)
+            if selected_ckpt is None:
                 p = out_dir / "best.pth"
-                ckpt_path = p if p.exists() else None
+                selected_ckpt = p if p.exists() else None
 
-        ckpt_str = str(ckpt_path) if ckpt_path is not None else ""
+        ckpt_str = str(selected_ckpt) if selected_ckpt is not None else ""
     else:
         ckpt_str = ""
 

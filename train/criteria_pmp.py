@@ -48,6 +48,7 @@ class PMPCompletionLoss(nn.Module):
         depth_min: float | None = None,
         depth_max: float | None = None,
         sparse_lidar_weight: float = 0.0,
+        l2_weight: float = 0.0,
         gt_outlier_kernel_size: int = -1,
         gt_outlier_threshold: float = -1.0,
     ):
@@ -57,6 +58,7 @@ class PMPCompletionLoss(nn.Module):
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.sparse_lidar_weight = float(sparse_lidar_weight)
+        self.l2_weight = float(l2_weight)
         self.gt_outlier_kernel_size = int(gt_outlier_kernel_size)
         self.gt_outlier_threshold = float(gt_outlier_threshold)
 
@@ -65,12 +67,19 @@ class PMPCompletionLoss(nn.Module):
         denom = torch.clamp(valid.sum(), min=1.0)
         return ((pred - gt).abs() * valid).sum() / denom
 
+    @staticmethod
+    def _masked_l2(pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        denom = torch.clamp(valid.sum(), min=1.0)
+        diff = pred - gt
+        return ((diff * diff) * valid).sum() / denom
+
     def _single_scale_loss(self, pred, dep_gt, dep_sparse_gt=None):
         valid_dense = _depth_valid_mask(dep_gt, self.t_valid, self.depth_min, self.depth_max)
         valid_dense = _remove_outlier_mask(
             dep_gt, valid_dense, self.gt_outlier_kernel_size, self.gt_outlier_threshold
         ).float()
         dense = self._masked_l1(pred, dep_gt, valid_dense)
+        dense_l2 = self._masked_l2(pred, dep_gt, valid_dense)
 
         sparse = pred.new_zeros(())
         if dep_sparse_gt is not None and self.sparse_lidar_weight > 0.0:
@@ -82,8 +91,8 @@ class PMPCompletionLoss(nn.Module):
             ).float()
             sparse = self._masked_l1(pred, dep_sparse_gt, valid_sparse)
 
-        total = dense + self.sparse_lidar_weight * sparse
-        return total, dense.detach(), sparse.detach()
+        total = dense + self.sparse_lidar_weight * sparse + self.l2_weight * dense_l2
+        return total, dense.detach(), sparse.detach(), dense_l2.detach()
 
     def forward(self, outputs, dep_gt, dep_sparse_gt=None):
         if isinstance(outputs, (list, tuple)):
@@ -93,13 +102,15 @@ class PMPCompletionLoss(nn.Module):
             loss = outputs[0].new_zeros(())
             loss_dense = outputs[0].new_zeros(())
             loss_sparse = outputs[0].new_zeros(())
+            loss_l2 = outputs[0].new_zeros(())
             for o, w in zip(outputs, self.ms_weights):
-                ls, ld, lsp = self._single_scale_loss(o, dep_gt, dep_sparse_gt=dep_sparse_gt)
+                ls, ld, lsp, ll2 = self._single_scale_loss(o, dep_gt, dep_sparse_gt=dep_sparse_gt)
                 loss = loss + float(w) * ls
                 loss_dense = loss_dense + float(w) * ld
                 loss_sparse = loss_sparse + float(w) * lsp
+                loss_l2 = loss_l2 + float(w) * ll2
         else:
-            loss, loss_dense, loss_sparse = self._single_scale_loss(
+            loss, loss_dense, loss_sparse, loss_l2 = self._single_scale_loss(
                 outputs, dep_gt, dep_sparse_gt=dep_sparse_gt
             )
 
@@ -107,4 +118,5 @@ class PMPCompletionLoss(nn.Module):
             "loss_pmp": float(loss.detach().cpu()),
             "loss_pmp_dense": float(loss_dense.detach().cpu()),
             "loss_pmp_sparse": float(loss_sparse.detach().cpu()),
+            "loss_pmp_l2": float(loss_l2.detach().cpu()),
         }

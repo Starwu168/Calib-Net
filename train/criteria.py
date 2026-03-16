@@ -45,23 +45,43 @@ def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict, dep_sparse_gt=No
     t_valid = float(cfg_loss.get("t_valid", 1e-3))
     depth_min = cfg_loss.get("depth_min", None)
     depth_max = cfg_loss.get("depth_max", None)
+    target_source = str(cfg_loss.get("target_source", "")).strip().lower()
+    mask_source = str(cfg_loss.get("valid_mask_source", "")).strip().lower()
     use_sparse_gt_mask = bool(cfg_loss.get("use_sparse_gt_mask", True))
     outlier_kernel = int(cfg_loss.get("gt_outlier_kernel_size", -1))
     outlier_thr = float(cfg_loss.get("gt_outlier_threshold", -1.0))
 
     mask_sparse = (dep_sp > 0).float()
-    gt_valid = _depth_valid_mask(dep_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max)
-    gt_valid = _remove_outlier_mask(dep_gt, gt_valid, outlier_kernel, outlier_thr)
+    dense_valid = _depth_valid_mask(dep_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max)
+    dense_valid = _remove_outlier_mask(dep_gt, dense_valid, outlier_kernel, outlier_thr)
 
-    if dep_sparse_gt is not None and use_sparse_gt_mask:
+    sparse_valid = None
+    if dep_sparse_gt is not None:
         sparse_valid = _depth_valid_mask(
             dep_sparse_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max
         )
         sparse_valid = _remove_outlier_mask(dep_sparse_gt, sparse_valid, outlier_kernel, outlier_thr)
+
+    if target_source == "sparse" and dep_sparse_gt is not None:
         target = torch.where(sparse_valid, dep_sparse_gt, dep_gt)
-        gt_valid = sparse_valid
+    elif target_source == "dense":
+        target = dep_gt
+    elif dep_sparse_gt is not None and use_sparse_gt_mask:
+        target = torch.where(sparse_valid, dep_sparse_gt, dep_gt)
     else:
         target = dep_gt
+
+    if mask_source == "sparse" and sparse_valid is not None:
+        gt_valid = sparse_valid
+    elif mask_source == "dense":
+        gt_valid = dense_valid
+    elif mask_source == "target":
+        gt_valid = _depth_valid_mask(target, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max)
+        gt_valid = _remove_outlier_mask(target, gt_valid, outlier_kernel, outlier_thr)
+    elif dep_sparse_gt is not None and use_sparse_gt_mask and sparse_valid is not None:
+        gt_valid = sparse_valid
+    else:
+        gt_valid = dense_valid
 
     mask = mask_sparse * gt_valid.float()
     mask_inv = 1.0 - mask_sparse

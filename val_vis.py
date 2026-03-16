@@ -69,8 +69,12 @@ def main():
     else:
         depth_max_list = [cfg["loss"].get("depth_max", None)]
 
+    metrics_protocol = cfg["loss"].get("metrics_protocol", "dc")
     metrics_map = {
-        dm: DCMetrics(t_valid=cfg["loss"].get("t_valid", 1e-3))
+        dm: DCMetrics(
+            t_valid=cfg["loss"].get("t_valid", 1e-3),
+            protocol=metrics_protocol,
+        )
         for dm in depth_max_list
     }
 
@@ -101,7 +105,6 @@ def main():
                 depth_min=cfg["loss"].get("depth_min", None),
                 depth_max=depth_max,
             )
-
         sparse_np = dep_sparse.squeeze().detach().cpu().numpy() if dep_sparse is not None else np.zeros_like(dep_interp.squeeze().detach().cpu().numpy())
         interp_np = dep_interp.squeeze().detach().cpu().numpy()
         pr_np = pred.squeeze().detach().cpu().numpy()
