@@ -30,17 +30,14 @@ class TotalCriterion(nn.Module):
             gt_outlier_threshold=float(cfg_loss.get("gt_outlier_threshold", -1.0)),
         )
 
-    def forward(self, pmp_out_list, s_pred_list, dep_sp, dep_gt, cfg_loss_calib: dict, dep_sparse_gt=None):
+    def forward(self, pmp_out_list, calib_aux_list, dep_gt, cfg_loss_calib: dict, dep_sparse_gt=None):
         cfg_calib = dict(cfg_loss_calib)
         cfg_calib.setdefault("t_valid", float(self.cfg_loss.get("t_valid", 1e-3)))
         cfg_calib.setdefault("depth_min", self.cfg_loss.get("depth_min", None))
         cfg_calib.setdefault("depth_max", self.cfg_loss.get("depth_max", None))
-        cfg_calib.setdefault("use_sparse_gt_mask", bool(self.cfg_loss.get("use_sparse_gt_mask", True)))
-        cfg_calib.setdefault("gt_outlier_kernel_size", int(self.cfg_loss.get("gt_outlier_kernel_size", -1)))
-        cfg_calib.setdefault("gt_outlier_threshold", float(self.cfg_loss.get("gt_outlier_threshold", -1.0)))
 
         loss_calib, parts_calib = compute_calib_losses(
-            s_pred_list, dep_sp, dep_gt, cfg_calib, dep_sparse_gt=dep_sparse_gt
+            calib_aux_list, dep_gt, cfg_calib
         )
         loss_pmp, parts_pmp = self.pmp_loss(pmp_out_list, dep_gt, dep_sparse_gt=dep_sparse_gt)
 

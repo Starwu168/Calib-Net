@@ -1,6 +1,6 @@
 exp:
   name: calib_pmp_zju
-  out_dir: /data00/wsx/code/calibnet/runs_ZJU4DRadarCam
+  out_dir: /data00/wsx/code/calibnet/runs_ZJU_latest
   seed: 123
   device: cuda
   amp: true
@@ -16,7 +16,7 @@ wandb:
 
 data:
   # official ZJU split
-  train_split: "train"
+  train_split: "train+val"
   # report on test like RadarCam-Depth / TacoDepth
   val_split: "test"
   dataset_class: "datasets.ZJU.ZJU4DRadarCam"
@@ -48,6 +48,9 @@ train:
 model:
   calib:
     num_scales: 5
+    predict_xyz: true
+    range_min_xyz: [0.0, 0.0, 0.0]
+    range_max_xyz: [1.5, 1.5, 3.0]
     rgb_channels: [32, 64, 96, 128, 160]
     radar_channels: [16, 24, 32, 40, 48]
     radar_token_down_ratio: 2
@@ -93,11 +96,9 @@ loss:
 
   # Calib-only losses
   calib:
-    target_source: "dense"
-    valid_mask_source: "dense"
-    w_sparse: 1.0
-    w_consistency: 0.3
-    w_energy: 0.05
-    w_outside: 0.1
-    use_sparse_gt_mask: false
+    w_point: 1.0
+    w_delta_reg: 0.05
+    w_range_reg: 0.02
+    delta_reg_weights: [1.0, 1.0, 1.0]
+    range_reg_weights: [1.0, 1.0, 1.0]
     ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

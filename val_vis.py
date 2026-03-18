@@ -87,7 +87,7 @@ def main():
         dep_interp = dep_interp.to(device)
         dep_sparse = dep_sparse.to(device) if dep_sparse is not None else None
 
-        pmp_out_list, _s_pred_list, _sprime = model(rgb, dep_sp, Kcam)
+        pmp_out_list, _s_pred_list, _sprime, _calib_aux = model(rgb, dep_sp, Kcam)
         pred = pmp_out_list[-1] if isinstance(pmp_out_list, (list, tuple)) else pmp_out_list
 
         if dep_sparse is not None and cfg["loss"].get("metrics_use_sparse_gt", True):

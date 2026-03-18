@@ -6,10 +6,29 @@ import torch.nn.functional as F
 
 from .rgb_encoder import RGBPyramidEncoder, ConvBNAct
 from .radar_wpool import RadarWPool
-from .attention import WindowSelfAttention2D, CrossFusionSamePos
+from .attention import CrossFusionSamePos
 from .calib_blocks import SEBlock, ResBlock
 from .token_sparse import SparseTokenEncoder
 from .attn_dilated import DilatedWindowSelfAttention2D
+
+
+def _scale_intrinsics(K: torch.Tensor, sx: float, sy: float) -> torch.Tensor:
+    K_scaled = K.clone()
+    K_scaled[:, 0, 0] = K_scaled[:, 0, 0] * sx
+    K_scaled[:, 1, 1] = K_scaled[:, 1, 1] * sy
+    K_scaled[:, 0, 2] = K_scaled[:, 0, 2] * sx
+    K_scaled[:, 1, 2] = K_scaled[:, 1, 2] * sy
+    return K_scaled
+
+
+def _make_xy_grid(height: int, width: int, device, dtype):
+    yy, xx = torch.meshgrid(
+        torch.arange(height, device=device, dtype=dtype),
+        torch.arange(width, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return xx.view(1, 1, height, width), yy.view(1, 1, height, width)
+
 
 class TokenEncoder(nn.Module):
     """
@@ -43,8 +62,24 @@ class TokenDecoder(nn.Module):
         return F.relu(s)  # 深度非负
 
 class PerScaleCalib(nn.Module):
-    def __init__(self, rgb_c, radar_c, sa_cfg, ca_out_dim, refine_cfg, token_down_ratio):
+    def __init__(
+        self,
+        rgb_c,
+        radar_c,
+        sa_cfg,
+        ca_out_dim,
+        refine_cfg,
+        token_down_ratio,
+        predict_xyz=False,
+        range_min_xyz=(0.0, 0.0, 0.0),
+        range_max_xyz=(1.0, 1.0, 1.0),
+    ):
         super().__init__()
+        self.predict_xyz = bool(predict_xyz)
+        range_min = torch.tensor(range_min_xyz, dtype=torch.float32).view(1, 3, 1, 1)
+        range_max = torch.tensor(range_max_xyz, dtype=torch.float32).view(1, 3, 1, 1)
+        self.register_buffer("range_min_xyz", range_min, persistent=False)
+        self.register_buffer("range_max_xyz", range_max, persistent=False)
 
         self.token_enc = SparseTokenEncoder(
             out_c=radar_c,
@@ -75,14 +110,89 @@ class PerScaleCalib(nn.Module):
         self.refine = nn.Sequential(*blocks)
         self.se = SEBlock(radar_c, refine_cfg.get("se_reduction", 8))
 
-        self.delta_head = nn.Sequential(
+        self.offset_head = nn.Sequential(
             nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
             nn.BatchNorm2d(radar_c),
             nn.GELU(),
-            nn.Conv2d(radar_c, 1, 1)
+            nn.Conv2d(radar_c, 3 if self.predict_xyz else 1, 1)
+        )
+        self.range_head = None
+        if self.predict_xyz:
+            self.range_head = nn.Sequential(
+                nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
+                nn.BatchNorm2d(radar_c),
+                nn.GELU(),
+                nn.Conv2d(radar_c, 3, 1)
+            )
+
+    @staticmethod
+    def _splat_depth(u_proj: torch.Tensor, v_proj: torch.Tensor, z_proj: torch.Tensor, valid: torch.Tensor):
+        B, _, H, W = z_proj.shape
+        num = z_proj.new_zeros((B, H * W))
+        den = z_proj.new_zeros((B, H * W))
+
+        u = u_proj.reshape(B, -1)
+        v = v_proj.reshape(B, -1)
+        z = z_proj.reshape(B, -1)
+        valid_flat = valid.reshape(B, -1)
+
+        u0 = torch.floor(u)
+        v0 = torch.floor(v)
+        u1 = u0 + 1.0
+        v1 = v0 + 1.0
+
+        neighbors = (
+            (u0, v0, (u1 - u) * (v1 - v)),
+            (u1, v0, (u - u0) * (v1 - v)),
+            (u0, v1, (u1 - u) * (v - v0)),
+            (u1, v1, (u - u0) * (v - v0)),
         )
 
-    def forward(self, S_l, M_l, fout_l):
+        for uu, vv, ww in neighbors:
+            inside = valid_flat & (uu >= 0) & (uu <= (W - 1)) & (vv >= 0) & (vv <= (H - 1))
+            weight = ww * inside.float()
+            idx = vv.clamp(0, H - 1).long() * W + uu.clamp(0, W - 1).long()
+            num.scatter_add_(1, idx, z * weight)
+            den.scatter_add_(1, idx, weight)
+
+        depth = (num / (den + 1e-6)).view(B, 1, H, W)
+        return torch.where(den.view(B, 1, H, W) > 1e-6, depth, torch.zeros_like(depth))
+
+    def _apply_xyz_delta(self, S_l: torch.Tensor, M_l: torch.Tensor, K_l: torch.Tensor, delta_xyz: torch.Tensor):
+        _, _, H, W = S_l.shape
+        xx, yy = _make_xy_grid(H, W, device=S_l.device, dtype=S_l.dtype)
+        xx = xx.expand(S_l.shape[0], -1, -1, -1)
+        yy = yy.expand(S_l.shape[0], -1, -1, -1)
+
+        fx = K_l[:, 0:1, 0:1].view(-1, 1, 1, 1)
+        fy = K_l[:, 1:2, 1:2].view(-1, 1, 1, 1)
+        cx = K_l[:, 0:1, 2:3].view(-1, 1, 1, 1)
+        cy = K_l[:, 1:2, 2:3].view(-1, 1, 1, 1)
+
+        z = S_l
+        x = z * (xx - cx) / (fx + 1e-6)
+        y = z * (yy - cy) / (fy + 1e-6)
+
+        delta_xyz = delta_xyz * M_l
+        x_new = x + delta_xyz[:, 0:1]
+        y_new = y + delta_xyz[:, 1:2]
+        z_new = torch.relu(z + delta_xyz[:, 2:3])
+
+        valid = (M_l > 0) & (z_new > 1e-6)
+        z_safe = torch.clamp(z_new, min=1e-6)
+        u_new = fx * x_new / z_safe + cx
+        v_new = fy * y_new / z_safe + cy
+        s_pred = self._splat_depth(u_new, v_new, z_new, valid)
+        info = {
+            "proj_u": u_new,
+            "proj_v": v_new,
+            "proj_z": z_new,
+            "valid": valid.float(),
+            "delta_xyz": delta_xyz,
+        }
+        return s_pred, info
+
+    def forward(self, S_l, M_l, fout_l, K_l=None):
         Hl, Wl = S_l.shape[-2:]
 
         # === token encode ===
@@ -99,18 +209,39 @@ class PerScaleCalib(nn.Module):
         delta_feat = self.se(self.refine(Fprime))
 
         # === 预测 ΔS (token 分辨率) ===
-        delta = self.delta_head(delta_feat)
+        offset = self.offset_head(delta_feat)
 
         # === 上采样回 Hl,Wl ===
-        delta = F.interpolate(delta, size=(Hl, Wl), mode="nearest")
+        offset = F.interpolate(offset, size=(Hl, Wl), mode="nearest")
 
-        # === 膨胀 mask（允许 n*n 邻域修正）===
-        M_dil = F.max_pool2d(M_l, kernel_size=3, stride=1, padding=1)
+        if self.predict_xyz:
+            if K_l is None:
+                raise ValueError("K_l is required when predict_xyz=True")
+            range_raw = self.range_head(delta_feat)
+            range_raw = F.interpolate(range_raw, size=(Hl, Wl), mode="nearest")
+            range_xyz = self.range_min_xyz + (self.range_max_xyz - self.range_min_xyz) * torch.sigmoid(range_raw)
+            delta_xyz = range_xyz * torch.tanh(offset)
+            S_pred, aux = self._apply_xyz_delta(S_l, M_l, K_l, delta_xyz)
+            aux["range_xyz"] = range_xyz * M_l
+        else:
+            # === 膨胀 mask（允许 n*n 邻域修正）===
+            M_dil = F.max_pool2d(M_l, kernel_size=3, stride=1, padding=1)
 
-        # === 残差修正 ===
-        S_pred = torch.relu(S_l + delta * M_dil)
+            # === 残差修正 ===
+            S_pred = torch.relu(S_l + offset * M_dil)
+            aux = {
+                "delta_xyz": torch.cat(
+                    [torch.zeros_like(S_pred), torch.zeros_like(S_pred), (S_pred - S_l) * M_dil],
+                    dim=1,
+                ),
+                "range_xyz": torch.zeros(S_pred.shape[0], 3, Hl, Wl, device=S_pred.device, dtype=S_pred.dtype),
+                "proj_u": None,
+                "proj_v": None,
+                "proj_z": None,
+                "valid": M_l.float(),
+            }
 
-        return S_pred
+        return S_pred, aux
 
 class CalibOnlyNet(nn.Module):
     """
@@ -123,9 +254,12 @@ class CalibOnlyNet(nn.Module):
         super().__init__()
         self.num_scales = cfg_model["num_scales"]
         assert self.num_scales == 5, "按 BPNet 5尺度"
+        self.predict_xyz = bool(cfg_model.get("predict_xyz", False))
 
         self.rgb_enc = RGBPyramidEncoder(cfg_model["rgb_channels"])
         self.wpool = RadarWPool()
+        range_min_xyz = tuple(cfg_model.get("range_min_xyz", (0.0, 0.0, 0.0)))
+        range_max_xyz = tuple(cfg_model.get("range_max_xyz", (1.0, 1.0, 1.0)))
 
         self.calibs = nn.ModuleList()
         token_down_ratio = cfg_model["radar_token_down_ratio"]
@@ -138,10 +272,13 @@ class CalibOnlyNet(nn.Module):
                     ca_out_dim=cfg_model["ca"]["out_dim"],
                     refine_cfg=cfg_model["refine"],
                     token_down_ratio=token_down_ratio,
+                    predict_xyz=self.predict_xyz,
+                    range_min_xyz=range_min_xyz,
+                    range_max_xyz=range_max_xyz,
                 )
             )
 
-    def forward(self, rgb: torch.Tensor, dep_sp: torch.Tensor):
+    def forward(self, rgb: torch.Tensor, dep_sp: torch.Tensor, K: torch.Tensor | None = None):
         """
         rgb:    (B,3,H,W)
         dep_sp: (B,1,H,W) sparse radar depth
@@ -150,11 +287,19 @@ class CalibOnlyNet(nn.Module):
         """
         fout_list = self.rgb_enc(rgb)
         s_pred_list = []
+        calib_aux_list = []
+        H, W = dep_sp.shape[-2:]
 
         for l in range(self.num_scales):
             fout_l = fout_list[l]
             s_l, m_l = self.wpool(dep_sp, fout_l)  # 对齐到该尺度
-            s_l_pred = self.calibs[l](s_l,m_l,fout_l)
+            K_l = None
+            if K is not None:
+                Hl, Wl = s_l.shape[-2:]
+                K_l = _scale_intrinsics(K, sx=Wl / float(W), sy=Hl / float(H))
+            s_l_pred, calib_aux = self.calibs[l](s_l, m_l, fout_l, K_l=K_l)
+            calib_aux["scale_hw"] = (s_l.shape[-2], s_l.shape[-1])
             s_pred_list.append(s_l_pred)
+            calib_aux_list.append(calib_aux)
 
-        return s_pred_list
+        return s_pred_list, calib_aux_list

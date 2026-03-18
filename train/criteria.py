@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 
@@ -17,107 +18,105 @@ def _depth_valid_mask(
     return m
 
 
-def _remove_outlier_mask(depth: torch.Tensor, valid: torch.Tensor, kernel_size: int, threshold: float):
-    if kernel_size <= 1 or threshold <= 0:
-        return valid
+def _sample_dense_depth(depth: torch.Tensor, u_full: torch.Tensor, v_full: torch.Tensor):
+    B, _, H, W = depth.shape
+    x_norm = 2.0 * u_full / max(W - 1, 1) - 1.0
+    y_norm = 2.0 * v_full / max(H - 1, 1) - 1.0
+    if x_norm.dim() == 4 and x_norm.shape[1] == 1:
+        x_norm = x_norm.squeeze(1)
+    if y_norm.dim() == 4 and y_norm.shape[1] == 1:
+        y_norm = y_norm.squeeze(1)
+    grid = torch.stack([x_norm, y_norm], dim=-1)
+    sampled = F.grid_sample(depth, grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return sampled
 
-    max_value = 10.0 * torch.clamp(depth.max(), min=1.0)
-    depth_filled = torch.where(valid, depth, torch.full_like(depth, max_value))
-    padding = kernel_size // 2
-    depth_pad = F.pad(depth_filled, (padding, padding, padding, padding), mode="constant", value=max_value)
-    min_values = -F.max_pool2d(-depth_pad, kernel_size=kernel_size, stride=1, padding=0)
 
-    not_outlier = ~(min_values < (depth - threshold))
-    return valid & not_outlier
-
-
-def compute_losses(s_pred_list, dep_sp, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
-    """
-    s_pred_list: list of S_l' (B,1,Hl,Wl)
-    dep_sp:      (B,1,H,W)
-    dep_gt:      (B,1,H,W)
-    dep_sparse_gt(optional): (B,1,H,W), sparse lidar GT
-    """
+def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict):
     ms_w = cfg_loss["ms_weights"]
-    assert len(ms_w) == len(s_pred_list)
+    assert len(ms_w) == len(calib_aux_list)
 
-    _, _, H, W = dep_sp.shape
+    _, _, H, W = dep_gt.shape
     t_valid = float(cfg_loss.get("t_valid", 1e-3))
     depth_min = cfg_loss.get("depth_min", None)
     depth_max = cfg_loss.get("depth_max", None)
-    target_source = str(cfg_loss.get("target_source", "")).strip().lower()
-    mask_source = str(cfg_loss.get("valid_mask_source", "")).strip().lower()
-    use_sparse_gt_mask = bool(cfg_loss.get("use_sparse_gt_mask", True))
-    outlier_kernel = int(cfg_loss.get("gt_outlier_kernel_size", -1))
-    outlier_thr = float(cfg_loss.get("gt_outlier_threshold", -1.0))
+    delta_weights = torch.tensor(
+        cfg_loss.get("delta_reg_weights", (1.0, 1.0, 1.0)),
+        dtype=dep_gt.dtype,
+        device=dep_gt.device,
+    ).view(1, 3, 1, 1)
+    range_weights = torch.tensor(
+        cfg_loss.get("range_reg_weights", (1.0, 1.0, 1.0)),
+        dtype=dep_gt.dtype,
+        device=dep_gt.device,
+    ).view(1, 3, 1, 1)
 
-    mask_sparse = (dep_sp > 0).float()
-    dense_valid = _depth_valid_mask(dep_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max)
-    dense_valid = _remove_outlier_mask(dep_gt, dense_valid, outlier_kernel, outlier_thr)
+    valid_gt = _depth_valid_mask(dep_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max).float()
 
-    sparse_valid = None
-    if dep_sparse_gt is not None:
-        sparse_valid = _depth_valid_mask(
-            dep_sparse_gt, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max
-        )
-        sparse_valid = _remove_outlier_mask(dep_sparse_gt, sparse_valid, outlier_kernel, outlier_thr)
+    loss_point = dep_gt.new_zeros(())
+    loss_delta_reg = dep_gt.new_zeros(())
+    loss_range_reg = dep_gt.new_zeros(())
+    valid_points_total = dep_gt.new_zeros(())
 
-    if target_source == "sparse" and dep_sparse_gt is not None:
-        target = torch.where(sparse_valid, dep_sparse_gt, dep_gt)
-    elif target_source == "dense":
-        target = dep_gt
-    elif dep_sparse_gt is not None and use_sparse_gt_mask:
-        target = torch.where(sparse_valid, dep_sparse_gt, dep_gt)
-    else:
-        target = dep_gt
+    mean_abs_delta = dep_gt.new_zeros((3,))
+    mean_range = dep_gt.new_zeros((3,))
 
-    if mask_source == "sparse" and sparse_valid is not None:
-        gt_valid = sparse_valid
-    elif mask_source == "dense":
-        gt_valid = dense_valid
-    elif mask_source == "target":
-        gt_valid = _depth_valid_mask(target, t_valid=t_valid, depth_min=depth_min, depth_max=depth_max)
-        gt_valid = _remove_outlier_mask(target, gt_valid, outlier_kernel, outlier_thr)
-    elif dep_sparse_gt is not None and use_sparse_gt_mask and sparse_valid is not None:
-        gt_valid = sparse_valid
-    else:
-        gt_valid = dense_valid
+    for w, calib_aux in zip(ms_w, calib_aux_list):
+        proj_u = calib_aux["proj_u"]
+        proj_v = calib_aux["proj_v"]
+        proj_z = calib_aux["proj_z"]
+        valid = calib_aux["valid"] > 0
+        delta_xyz = calib_aux["delta_xyz"]
+        range_xyz = calib_aux["range_xyz"]
+        Hl, Wl = calib_aux["scale_hw"]
 
-    mask = mask_sparse * gt_valid.float()
-    mask_inv = 1.0 - mask_sparse
+        scale_x = W / float(Wl)
+        scale_y = H / float(Hl)
+        u_full = proj_u * scale_x
+        v_full = proj_v * scale_y
 
-    loss_sparse = 0.0
-    loss_consis = 0.0
-    loss_energy = 0.0
-    loss_outside = 0.0
+        inside = (u_full >= 0) & (u_full <= (W - 1)) & (v_full >= 0) & (v_full <= (H - 1))
+        gt_sample = _sample_dense_depth(dep_gt, u_full, v_full)
+        gt_valid_sample = _sample_dense_depth(valid_gt, u_full, v_full)
 
-    for l, s_l in enumerate(s_pred_list):
-        s_up = F.interpolate(s_l, size=(H, W), mode="nearest")
+        point_mask = valid & inside & (proj_z > t_valid) & (gt_valid_sample > 0.5)
+        point_mask_f = point_mask.float()
+        point_denom = point_mask_f.sum()
 
-        ls = F.smooth_l1_loss(s_up * mask, target * mask, reduction="sum") / (mask.sum() + 1e-6)
-        lc = F.smooth_l1_loss(s_up * mask, dep_sp * mask, reduction="sum") / (mask.sum() + 1e-6)
-        delta_mag = torch.abs((s_up - dep_sp) * mask).sum() / (mask.sum() + 1e-6)
-        l_outside = torch.abs(s_up * mask_inv).sum() / (mask_inv.sum() + 1e-6)
+        if point_denom.detach().item() > 0.0:
+            point_loss = F.smooth_l1_loss(proj_z * point_mask_f, gt_sample * point_mask_f, reduction="sum")
+            point_loss = point_loss / (point_denom + 1e-6)
+            loss_point = loss_point + float(w) * point_loss
+            valid_points_total = valid_points_total + point_denom
 
-        loss_sparse += ms_w[l] * ls
-        loss_consis += ms_w[l] * lc
-        loss_energy += ms_w[l] * delta_mag
-        loss_outside += ms_w[l] * l_outside
+        reg_mask = valid.float()
+        reg_denom = reg_mask.sum() + 1e-6
 
-    w_sparse = cfg_loss["w_sparse"]
-    w_consis = cfg_loss["w_consistency"]
-    w_energy = cfg_loss["w_energy"]
-    w_outside = cfg_loss["w_outside"]
+        delta_abs = delta_xyz.abs()
+        range_pos = range_xyz
 
-    total = (
-        w_sparse * loss_sparse
-        + w_consis * loss_consis
-        + w_energy * loss_energy
-        + w_outside * loss_outside
-    )
+        delta_reg = ((delta_abs * delta_weights) * reg_mask).sum() / reg_denom
+        range_reg = ((range_pos * range_weights) * reg_mask).sum() / reg_denom
+
+        loss_delta_reg = loss_delta_reg + float(w) * delta_reg
+        loss_range_reg = loss_range_reg + float(w) * range_reg
+
+        mean_abs_delta = mean_abs_delta + float(w) * (delta_abs * reg_mask).sum(dim=(0, 2, 3)) / reg_denom
+        mean_range = mean_range + float(w) * (range_pos * reg_mask).sum(dim=(0, 2, 3)) / reg_denom
+
+    w_point = float(cfg_loss.get("w_point", 1.0))
+    w_delta_reg = float(cfg_loss.get("w_delta_reg", 0.0))
+    w_range_reg = float(cfg_loss.get("w_range_reg", 0.0))
+
+    total = w_point * loss_point + w_delta_reg * loss_delta_reg + w_range_reg * loss_range_reg
     return total, {
-        "loss_sparse": float(loss_sparse.detach().cpu()),
-        "loss_consis": float(loss_consis.detach().cpu()),
-        "loss_energy": float(loss_energy.detach().cpu()),
-        "loss_outside": float(loss_outside.detach().cpu()),
+        "loss_point": float(loss_point.detach().cpu()),
+        "loss_delta_reg": float(loss_delta_reg.detach().cpu()),
+        "loss_range_reg": float(loss_range_reg.detach().cpu()),
+        "mean_abs_delta_x": float(mean_abs_delta[0].detach().cpu()),
+        "mean_abs_delta_y": float(mean_abs_delta[1].detach().cpu()),
+        "mean_abs_delta_z": float(mean_abs_delta[2].detach().cpu()),
+        "mean_range_x": float(mean_range[0].detach().cpu()),
+        "mean_range_y": float(mean_range[1].detach().cpu()),
+        "mean_range_z": float(mean_range[2].detach().cpu()),
+        "num_calib_points": float(valid_points_total.detach().cpu()),
     }
