@@ -9,12 +9,15 @@ def _depth_valid_mask(
     t_valid: float,
     depth_min: float | None,
     depth_max: float | None,
+    ignore_top_rows: int = 0,
 ) -> torch.Tensor:
     m = depth > t_valid
     if depth_min is not None:
         m = m & (depth > float(depth_min))
     if depth_max is not None:
         m = m & (depth < float(depth_max))
+    if ignore_top_rows > 0:
+        m[..., :ignore_top_rows, :] = False
     return m
 
 
@@ -47,8 +50,10 @@ class PMPCompletionLoss(nn.Module):
         t_valid: float = 1e-3,
         depth_min: float | None = None,
         depth_max: float | None = None,
+        dense_weight: float = 1.0,
         sparse_lidar_weight: float = 0.0,
-        l2_weight: float = 0.0,
+        sparse_huber_weight: float = 0.0,
+        sparse_huber_beta: float = 1.0,
         gt_outlier_kernel_size: int = -1,
         gt_outlier_threshold: float = -1.0,
     ):
@@ -57,42 +62,57 @@ class PMPCompletionLoss(nn.Module):
         self.t_valid = float(t_valid)
         self.depth_min = depth_min
         self.depth_max = depth_max
+        self.dense_weight = float(dense_weight)
         self.sparse_lidar_weight = float(sparse_lidar_weight)
-        self.l2_weight = float(l2_weight)
+        self.sparse_huber_weight = float(sparse_huber_weight)
+        self.sparse_huber_beta = float(sparse_huber_beta)
         self.gt_outlier_kernel_size = int(gt_outlier_kernel_size)
         self.gt_outlier_threshold = float(gt_outlier_threshold)
+        self.ignore_top_rows = 0
 
     @staticmethod
     def _masked_l1(pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         denom = torch.clamp(valid.sum(), min=1.0)
         return ((pred - gt).abs() * valid).sum() / denom
 
-    @staticmethod
-    def _masked_l2(pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    def _masked_huber(self, pred: torch.Tensor, gt: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
         denom = torch.clamp(valid.sum(), min=1.0)
-        diff = pred - gt
-        return ((diff * diff) * valid).sum() / denom
+        loss = torch.nn.functional.smooth_l1_loss(
+            pred,
+            gt,
+            reduction="none",
+            beta=self.sparse_huber_beta,
+        )
+        return (loss * valid).sum() / denom
 
     def _single_scale_loss(self, pred, dep_gt, dep_sparse_gt=None):
-        valid_dense = _depth_valid_mask(dep_gt, self.t_valid, self.depth_min, self.depth_max)
+        valid_dense = _depth_valid_mask(
+            dep_gt,
+            self.t_valid,
+            self.depth_min,
+            self.depth_max,
+            ignore_top_rows=self.ignore_top_rows,
+        )
         valid_dense = _remove_outlier_mask(
             dep_gt, valid_dense, self.gt_outlier_kernel_size, self.gt_outlier_threshold
         ).float()
-        dense = self._masked_l1(pred, dep_gt, valid_dense)
-        dense_l2 = self._masked_l2(pred, dep_gt, valid_dense)
+        dense = self._masked_l1(pred, dep_gt, valid_dense) if self.dense_weight > 0.0 else pred.new_zeros(())
 
         sparse = pred.new_zeros(())
-        if dep_sparse_gt is not None and self.sparse_lidar_weight > 0.0:
-            valid_sparse = _depth_valid_mask(
-                dep_sparse_gt, self.t_valid, self.depth_min, self.depth_max
-            )
-            valid_sparse = _remove_outlier_mask(
-                dep_sparse_gt, valid_sparse, self.gt_outlier_kernel_size, self.gt_outlier_threshold
-            ).float()
-            sparse = self._masked_l1(pred, dep_sparse_gt, valid_sparse)
+        sparse_huber = pred.new_zeros(())
+        if dep_sparse_gt is not None and (self.sparse_lidar_weight > 0.0 or self.sparse_huber_weight > 0.0):
+            valid_sparse = (dep_sparse_gt > self.t_valid).float()
+            if self.sparse_lidar_weight > 0.0:
+                sparse = self._masked_l1(pred, dep_sparse_gt, valid_sparse)
+            if self.sparse_huber_weight > 0.0:
+                sparse_huber = self._masked_huber(pred, dep_sparse_gt, valid_sparse)
 
-        total = dense + self.sparse_lidar_weight * sparse + self.l2_weight * dense_l2
-        return total, dense.detach(), sparse.detach(), dense_l2.detach()
+        total = (
+            self.dense_weight * dense
+            + self.sparse_lidar_weight * sparse
+            + self.sparse_huber_weight * sparse_huber
+        )
+        return total, dense.detach(), sparse.detach(), sparse_huber.detach()
 
     def forward(self, outputs, dep_gt, dep_sparse_gt=None):
         if isinstance(outputs, (list, tuple)):
@@ -102,15 +122,15 @@ class PMPCompletionLoss(nn.Module):
             loss = outputs[0].new_zeros(())
             loss_dense = outputs[0].new_zeros(())
             loss_sparse = outputs[0].new_zeros(())
-            loss_l2 = outputs[0].new_zeros(())
+            loss_sparse_huber = outputs[0].new_zeros(())
             for o, w in zip(outputs, self.ms_weights):
-                ls, ld, lsp, ll2 = self._single_scale_loss(o, dep_gt, dep_sparse_gt=dep_sparse_gt)
+                ls, ld, lsp, lsh = self._single_scale_loss(o, dep_gt, dep_sparse_gt=dep_sparse_gt)
                 loss = loss + float(w) * ls
                 loss_dense = loss_dense + float(w) * ld
                 loss_sparse = loss_sparse + float(w) * lsp
-                loss_l2 = loss_l2 + float(w) * ll2
+                loss_sparse_huber = loss_sparse_huber + float(w) * lsh
         else:
-            loss, loss_dense, loss_sparse, loss_l2 = self._single_scale_loss(
+            loss, loss_dense, loss_sparse, loss_sparse_huber = self._single_scale_loss(
                 outputs, dep_gt, dep_sparse_gt=dep_sparse_gt
             )
 
@@ -118,5 +138,5 @@ class PMPCompletionLoss(nn.Module):
             "loss_pmp": float(loss.detach().cpu()),
             "loss_pmp_dense": float(loss_dense.detach().cpu()),
             "loss_pmp_sparse": float(loss_sparse.detach().cpu()),
-            "loss_pmp_l2": float(loss_l2.detach().cpu()),
+            "loss_pmp_sparse_huber": float(loss_sparse_huber.detach().cpu()),
         }

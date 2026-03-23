@@ -197,7 +197,7 @@ def train_one_epoch(
                 f"point={meter.avg('loss_point'):.6f} "
                 f"delta_reg={meter.avg('loss_delta_reg'):.6f} "
                 f"range_reg={meter.avg('loss_range_reg'):.6f} "
-                f"pmp_l2={meter.avg('loss_pmp_l2'):.6f}"
+                f"pmp_sparse_huber={meter.avg('loss_pmp_sparse_huber'):.6f}"
             )
             if wb is not None and wb.is_active:
                 global_step = step_offset + step + 1
@@ -217,7 +217,7 @@ def train_one_epoch(
                         "train/iter_mean_range_y": meter.avg("mean_range_y"),
                         "train/iter_mean_range_z": meter.avg("mean_range_z"),
                         "train/iter_num_calib_points": meter.avg("num_calib_points"),
-                        "train/iter_loss_pmp_l2": meter.avg("loss_pmp_l2"),
+                        "train/iter_loss_pmp_sparse_huber": meter.avg("loss_pmp_sparse_huber"),
                     },
                     step=global_step,
                 )
@@ -424,7 +424,7 @@ def main():
 
         base_lr = cfg["train"]["lr"]
         decay_steps = (epoch - 1) // 10
-        new_lr = max(base_lr - decay_steps * 2e-5, 1e-7)
+        new_lr = max(base_lr - decay_steps * 1e-5, 1e-7)
         for param_group in optimizer.param_groups:
             param_group["lr"] = new_lr
 
@@ -465,7 +465,7 @@ def main():
                         "train/mean_range_y": train_meter.avg("mean_range_y"),
                         "train/mean_range_z": train_meter.avg("mean_range_z"),
                         "train/num_calib_points": train_meter.avg("num_calib_points"),
-                        "train/loss_pmp_l2": train_meter.avg("loss_pmp_l2"),
+                        "train/loss_pmp_sparse_huber": train_meter.avg("loss_pmp_sparse_huber"),
                         "train/MAE": train_metrics["MAE"],
                         "train/RMSE": train_metrics["RMSE"],
                         "train/iMAE": train_metrics["iMAE"],
@@ -494,7 +494,7 @@ def main():
                             "val/loss": val_meter.avg("loss"),
                             "val/loss_calib": val_meter.avg("loss_calib"),
                             "val/loss_pmp": val_meter.avg("loss_pmp"),
-                            "val/loss_pmp_l2": val_meter.avg("loss_pmp_l2"),
+                            "val/loss_pmp_sparse_huber": val_meter.avg("loss_pmp_sparse_huber"),
                             "val/MAE": val_metrics["MAE"],
                             "val/RMSE": val_metrics["RMSE"],
                             "val/iMAE": val_metrics["iMAE"],

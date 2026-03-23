@@ -1,6 +1,6 @@
 exp:
   name: calib_pmp_zju
-  out_dir: /data00/wsx/code/calibnet/runs_ZJU_latest
+  out_dir: /data00/wsx/code/calibnet/runs_ZJU_loss_radarcam
   seed: 123
   device: cuda
   amp: true
@@ -37,7 +37,7 @@ data:
   val_batch_size: 8
 
 train:
-  epochs: 70
+  epochs: 100
   lr: 2.0e-4
   weight_decay: 1.0e-4
   log_every: 500
@@ -80,25 +80,36 @@ loss:
   # - evaluate on sparse LiDAR with RadarCam-Depth metric units
   t_valid: 0.001
   depth_min: 0.0
-  depth_max: 80.0
+  depth_max: 180
+  ignore_top_rows: 0
   use_sparse_gt_mask: false
   metrics_use_sparse_gt: true
   metrics_target: "sparse"
   metrics_mask_source: "sparse"
   metrics_protocol: "radarcam"
-  gt_outlier_kernel_size: -1
+  gt_outlier_kernel_size: 7
   gt_outlier_threshold: 1.5
 
   # PMP supervision
   pmp_ms_weights: [0.03, 0.06, 0.12, 0.25, 0.5, 1.0]
+  pmp_depth_max: null
+  pmp_dense_weight: 0.0
   pmp_sparse_weight: 1.0
-  pmp_l2_weight: 0.00
+  pmp_sparse_huber_weight: 0.2
+  pmp_sparse_huber_beta: 1.0
 
   # Calib-only losses
   calib:
+    supervision_target: "dense+sparse"
+    dense_sup_weight: 1.0
+    sparse_sup_weight: 1.0
     w_point: 1.0
     w_delta_reg: 0.05
     w_range_reg: 0.02
+    ignore_top_rows: 0
+    depth_max: null
+    gt_outlier_kernel_size: 7
+    gt_outlier_threshold: 1.5
     delta_reg_weights: [1.0, 1.0, 1.0]
     range_reg_weights: [1.0, 1.0, 1.0]
     ms_weights: [1.0, 0.7, 0.5, 0.35, 0.25]

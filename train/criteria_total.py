@@ -22,13 +22,16 @@ class TotalCriterion(nn.Module):
         self.pmp_loss = PMPCompletionLoss(
             ms_weights=tuple(cfg_loss.get("pmp_ms_weights", (0.03, 0.06, 0.12, 0.25, 0.5, 1.0))),
             t_valid=float(cfg_loss.get("t_valid", 1e-3)),
-            depth_min=cfg_loss.get("depth_min", None),
-            depth_max=cfg_loss.get("depth_max", None),
+            depth_min=cfg_loss.get("pmp_depth_min", cfg_loss.get("depth_min", None)),
+            depth_max=cfg_loss.get("pmp_depth_max", cfg_loss.get("depth_max", None)),
+            dense_weight=float(cfg_loss.get("pmp_dense_weight", 1.0)),
             sparse_lidar_weight=float(cfg_loss.get("pmp_sparse_weight", 0.0)),
-            l2_weight=float(cfg_loss.get("pmp_l2_weight", 0.0)),
+            sparse_huber_weight=float(cfg_loss.get("pmp_sparse_huber_weight", cfg_loss.get("pmp_huber_weight", cfg_loss.get("pmp_l2_weight", 0.0)))),
+            sparse_huber_beta=float(cfg_loss.get("pmp_sparse_huber_beta", cfg_loss.get("pmp_huber_beta", 1.0))),
             gt_outlier_kernel_size=int(cfg_loss.get("gt_outlier_kernel_size", -1)),
             gt_outlier_threshold=float(cfg_loss.get("gt_outlier_threshold", -1.0)),
         )
+        self.pmp_loss.ignore_top_rows = int(cfg_loss.get("pmp_ignore_top_rows", cfg_loss.get("ignore_top_rows", 0)))
 
     def forward(self, pmp_out_list, calib_aux_list, dep_gt, cfg_loss_calib: dict, dep_sparse_gt=None):
         cfg_calib = dict(cfg_loss_calib)
@@ -37,7 +40,7 @@ class TotalCriterion(nn.Module):
         cfg_calib.setdefault("depth_max", self.cfg_loss.get("depth_max", None))
 
         loss_calib, parts_calib = compute_calib_losses(
-            calib_aux_list, dep_gt, cfg_calib
+            calib_aux_list, dep_gt, cfg_calib, dep_sparse_gt=dep_sparse_gt
         )
         loss_pmp, parts_pmp = self.pmp_loss(pmp_out_list, dep_gt, dep_sparse_gt=dep_sparse_gt)
 
