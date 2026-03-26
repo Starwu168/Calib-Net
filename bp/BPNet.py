@@ -13,7 +13,8 @@ __all__ = ['Pre_MF_Post', 'Net']
 
 class Net(nn.Module):
     def __init__(self, block=BasicBlock, bc=16, img_layers=[2, 2, 2, 2, 2, 2],
-                 drop_path=0.1, norm_layer=nn.BatchNorm2d, padding_mode='zeros', drift=1e6):
+                 drop_path=0.1, norm_layer=nn.BatchNorm2d, padding_mode='zeros', drift=1e6,
+                 conf_prop_strength=1.0, conf_cspn_strength=1.0):
         super().__init__()
         self.drift = drift
         self._norm_layer = norm_layer
@@ -41,14 +42,20 @@ class Net(nn.Module):
         self.inplanes = bc * 16
         self.layer5_img = self._make_layer(block, bc * 16, img_layers[5], stride=2)
 
-        self.pred0 = PMP(level=0, in_ch=bc * 4, out_ch=bc * 2, drop_path=drop_path, pool=False)
-        self.pred1 = PMP(level=1, in_ch=bc * 8, out_ch=bc * 4, drop_path=drop_path)
-        self.pred2 = PMP(level=2, in_ch=bc * 16, out_ch=bc * 8, drop_path=drop_path)
-        self.pred3 = PMP(level=3, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path)
-        self.pred4 = PMP(level=4, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path)
-        self.pred5 = PMP(level=5, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path, up=False)
+        self.pred0 = PMP(level=0, in_ch=bc * 4, out_ch=bc * 2, drop_path=drop_path, pool=False,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
+        self.pred1 = PMP(level=1, in_ch=bc * 8, out_ch=bc * 4, drop_path=drop_path,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
+        self.pred2 = PMP(level=2, in_ch=bc * 16, out_ch=bc * 8, drop_path=drop_path,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
+        self.pred3 = PMP(level=3, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
+        self.pred4 = PMP(level=4, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
+        self.pred5 = PMP(level=5, in_ch=bc * 16, out_ch=bc * 16, drop_path=drop_path, up=False,
+                         conf_prop_strength=conf_prop_strength, conf_cspn_strength=conf_cspn_strength)
 
-    def forward(self, I, S, K):
+    def forward(self, I, S, C, K):
         """
         I: Bx3xHxW
         S: Bx1xHxW
@@ -62,22 +69,22 @@ class Net(nn.Module):
         XI4 = self.layer4_img(XI3)
         XI5 = self.layer5_img(XI4)
 
-        fout, dout = self.pred5(fout=None, dout=None, XI=XI5, S=S, K=K)
+        fout, dout = self.pred5(fout=None, dout=None, XI=XI5, S=S, C=C, K=K)
         output.append(F.interpolate(dout, scale_factor=2 ** 5, mode='bilinear', align_corners=True))
 
-        fout, dout = self.pred4(fout=fout, dout=dout, XI=XI4, S=S, K=K)
+        fout, dout = self.pred4(fout=fout, dout=dout, XI=XI4, S=S, C=C, K=K)
         output.append(F.interpolate(dout, scale_factor=2 ** 4, mode='bilinear', align_corners=True))
 
-        fout, dout = self.pred3(fout=fout, dout=dout, XI=XI3, S=S, K=K)
+        fout, dout = self.pred3(fout=fout, dout=dout, XI=XI3, S=S, C=C, K=K)
         output.append(F.interpolate(dout, scale_factor=2 ** 3, mode='bilinear', align_corners=True))
 
-        fout, dout = self.pred2(fout=fout, dout=dout, XI=XI2, S=S, K=K)
+        fout, dout = self.pred2(fout=fout, dout=dout, XI=XI2, S=S, C=C, K=K)
         output.append(F.interpolate(dout, scale_factor=2 ** 2, mode='bilinear', align_corners=True))
 
-        fout, dout = self.pred1(fout=fout, dout=dout, XI=XI1, S=S, K=K)
+        fout, dout = self.pred1(fout=fout, dout=dout, XI=XI1, S=S, C=C, K=K)
         output.append(F.interpolate(dout, scale_factor=2 ** 1, mode='bilinear', align_corners=True))
 
-        fout, dout = self.pred0(fout=fout, dout=dout, XI=XI0, S=S, K=K)
+        fout, dout = self.pred0(fout=fout, dout=dout, XI=XI0, S=S, C=C, K=K)
         output.append(dout)
         return output
 
@@ -110,8 +117,12 @@ class Net(nn.Module):
         return nn.Sequential(*layers)
 
 
-def Pre_MF_Post():
-    net = Net()
+def Pre_MF_Post(cfg=None):
+    cfg = cfg or {}
+    net = Net(
+        conf_prop_strength=float(cfg.get("bp_conf_prop_strength", 1.0)),
+        conf_cspn_strength=float(cfg.get("bp_conf_cspn_strength", 1.0)),
+    )
     net.apply(functools.partial(weights_init, mode='trunc'))
     for m in net.modules():
         if isinstance(m, GenKernel) and m.conv[1].conv.bn.weight is not None:

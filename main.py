@@ -155,7 +155,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=amp):
-            pmp_out_list, _s_pred_list, _sprime, calib_aux_list = model(rgb, dep_sp, Kcam)
+            pmp_out_list, _s_pred_list, _sprime, _cprime, calib_aux_list = model(rgb, dep_sp, Kcam)
             loss, parts = criterion(
                 pmp_out_list=pmp_out_list,
                 calib_aux_list=calib_aux_list,
@@ -195,6 +195,7 @@ def train_one_epoch(
                 f"calib={meter.avg('loss_calib'):.6f} "
                 f"pmp={meter.avg('loss_pmp'):.6f} "
                 f"point={meter.avg('loss_point'):.6f} "
+                f"conf={meter.avg('loss_conf'):.6f} "
                 f"delta_reg={meter.avg('loss_delta_reg'):.6f} "
                 f"range_reg={meter.avg('loss_range_reg'):.6f} "
                 f"pmp_sparse_huber={meter.avg('loss_pmp_sparse_huber'):.6f}"
@@ -208,6 +209,7 @@ def train_one_epoch(
                         "train/iter_loss_calib": meter.avg("loss_calib"),
                         "train/iter_loss_pmp": meter.avg("loss_pmp"),
                         "train/iter_loss_point": meter.avg("loss_point"),
+                        "train/iter_loss_conf": meter.avg("loss_conf"),
                         "train/iter_loss_delta_reg": meter.avg("loss_delta_reg"),
                         "train/iter_loss_range_reg": meter.avg("loss_range_reg"),
                         "train/iter_mean_abs_delta_x": meter.avg("mean_abs_delta_x"),
@@ -245,7 +247,7 @@ def validate(model, loader, device, cfg, criterion: TotalCriterion):
         dep_sparse = dep_sparse.to(device, non_blocking=True) if dep_sparse is not None else None
 
         with torch.amp.autocast("cuda", enabled=cfg["exp"]["amp"]):
-            pmp_out_list, _s_pred_list, _sprime, calib_aux_list = model(rgb, dep_sp, Kcam)
+            pmp_out_list, _s_pred_list, _sprime, _cprime, calib_aux_list = model(rgb, dep_sp, Kcam)
             loss, parts = criterion(
                 pmp_out_list=pmp_out_list,
                 calib_aux_list=calib_aux_list,
@@ -456,6 +458,7 @@ def main():
                         "train/loss_calib": train_meter.avg("loss_calib"),
                         "train/loss_pmp": train_meter.avg("loss_pmp"),
                         "train/loss_point": train_meter.avg("loss_point"),
+                        "train/loss_conf": train_meter.avg("loss_conf"),
                         "train/loss_delta_reg": train_meter.avg("loss_delta_reg"),
                         "train/loss_range_reg": train_meter.avg("loss_range_reg"),
                         "train/mean_abs_delta_x": train_meter.avg("mean_abs_delta_x"),
@@ -494,6 +497,7 @@ def main():
                             "val/loss": val_meter.avg("loss"),
                             "val/loss_calib": val_meter.avg("loss_calib"),
                             "val/loss_pmp": val_meter.avg("loss_pmp"),
+                            "val/loss_conf": val_meter.avg("loss_conf"),
                             "val/loss_pmp_sparse_huber": val_meter.avg("loss_pmp_sparse_huber"),
                             "val/MAE": val_metrics["MAE"],
                             "val/RMSE": val_metrics["RMSE"],

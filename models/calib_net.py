@@ -116,6 +116,12 @@ class PerScaleCalib(nn.Module):
             nn.GELU(),
             nn.Conv2d(radar_c, 3 if self.predict_xyz else 1, 1)
         )
+        self.conf_head = nn.Sequential(
+            nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(radar_c),
+            nn.GELU(),
+            nn.Conv2d(radar_c, 1, 1)
+        )
         self.range_head = None
         if self.predict_xyz:
             self.range_head = nn.Sequential(
@@ -126,14 +132,14 @@ class PerScaleCalib(nn.Module):
             )
 
     @staticmethod
-    def _splat_depth(u_proj: torch.Tensor, v_proj: torch.Tensor, z_proj: torch.Tensor, valid: torch.Tensor):
-        B, _, H, W = z_proj.shape
-        num = z_proj.new_zeros((B, H * W))
-        den = z_proj.new_zeros((B, H * W))
+    def _splat_average(u_proj: torch.Tensor, v_proj: torch.Tensor, value: torch.Tensor, valid: torch.Tensor):
+        B, _, H, W = value.shape
+        num = value.new_zeros((B, H * W))
+        den = value.new_zeros((B, H * W))
 
         u = u_proj.reshape(B, -1)
         v = v_proj.reshape(B, -1)
-        z = z_proj.reshape(B, -1)
+        val = value.reshape(B, -1)
         valid_flat = valid.reshape(B, -1)
 
         u0 = torch.floor(u)
@@ -152,13 +158,20 @@ class PerScaleCalib(nn.Module):
             inside = valid_flat & (uu >= 0) & (uu <= (W - 1)) & (vv >= 0) & (vv <= (H - 1))
             weight = ww * inside.float()
             idx = vv.clamp(0, H - 1).long() * W + uu.clamp(0, W - 1).long()
-            num.scatter_add_(1, idx, z * weight)
+            num.scatter_add_(1, idx, val * weight)
             den.scatter_add_(1, idx, weight)
 
-        depth = (num / (den + 1e-6)).view(B, 1, H, W)
-        return torch.where(den.view(B, 1, H, W) > 1e-6, depth, torch.zeros_like(depth))
+        out = (num / (den + 1e-6)).view(B, 1, H, W)
+        return torch.where(den.view(B, 1, H, W) > 1e-6, out, torch.zeros_like(out))
 
-    def _apply_xyz_delta(self, S_l: torch.Tensor, M_l: torch.Tensor, K_l: torch.Tensor, delta_xyz: torch.Tensor):
+    def _apply_xyz_delta(
+        self,
+        S_l: torch.Tensor,
+        M_l: torch.Tensor,
+        K_l: torch.Tensor,
+        delta_xyz: torch.Tensor,
+        conf_map: torch.Tensor,
+    ):
         _, _, H, W = S_l.shape
         xx, yy = _make_xy_grid(H, W, device=S_l.device, dtype=S_l.dtype)
         xx = xx.expand(S_l.shape[0], -1, -1, -1)
@@ -182,15 +195,18 @@ class PerScaleCalib(nn.Module):
         z_safe = torch.clamp(z_new, min=1e-6)
         u_new = fx * x_new / z_safe + cx
         v_new = fy * y_new / z_safe + cy
-        s_pred = self._splat_depth(u_new, v_new, z_new, valid)
+        proj_conf = conf_map * M_l
+        s_pred = self._splat_average(u_new, v_new, z_new, valid)
+        c_pred = self._splat_average(u_new, v_new, proj_conf, valid)
         info = {
             "proj_u": u_new,
             "proj_v": v_new,
             "proj_z": z_new,
+            "proj_conf": proj_conf,
             "valid": valid.float(),
             "delta_xyz": delta_xyz,
         }
-        return s_pred, info
+        return s_pred, c_pred, info
 
     def forward(self, S_l, M_l, fout_l, K_l=None):
         Hl, Wl = S_l.shape[-2:]
@@ -210,9 +226,11 @@ class PerScaleCalib(nn.Module):
 
         # === 预测 ΔS (token 分辨率) ===
         offset = self.offset_head(delta_feat)
+        conf = torch.sigmoid(self.conf_head(delta_feat))
 
         # === 上采样回 Hl,Wl ===
         offset = F.interpolate(offset, size=(Hl, Wl), mode="nearest")
+        conf = F.interpolate(conf, size=(Hl, Wl), mode="nearest") * M_l
 
         if self.predict_xyz:
             if K_l is None:
@@ -221,7 +239,7 @@ class PerScaleCalib(nn.Module):
             range_raw = F.interpolate(range_raw, size=(Hl, Wl), mode="nearest")
             range_xyz = self.range_min_xyz + (self.range_max_xyz - self.range_min_xyz) * torch.sigmoid(range_raw)
             delta_xyz = range_xyz * torch.tanh(offset)
-            S_pred, aux = self._apply_xyz_delta(S_l, M_l, K_l, delta_xyz)
+            S_pred, C_pred, aux = self._apply_xyz_delta(S_l, M_l, K_l, delta_xyz, conf)
             aux["range_xyz"] = range_xyz * M_l
         else:
             # === 膨胀 mask（允许 n*n 邻域修正）===
@@ -229,6 +247,7 @@ class PerScaleCalib(nn.Module):
 
             # === 残差修正 ===
             S_pred = torch.relu(S_l + offset * M_dil)
+            C_pred = conf * M_l
             aux = {
                 "delta_xyz": torch.cat(
                     [torch.zeros_like(S_pred), torch.zeros_like(S_pred), (S_pred - S_l) * M_dil],
@@ -237,11 +256,12 @@ class PerScaleCalib(nn.Module):
                 "range_xyz": torch.zeros(S_pred.shape[0], 3, Hl, Wl, device=S_pred.device, dtype=S_pred.dtype),
                 "proj_u": None,
                 "proj_v": None,
-                "proj_z": None,
+                "proj_z": S_pred,
+                "proj_conf": C_pred,
                 "valid": M_l.float(),
             }
 
-        return S_pred, aux
+        return S_pred, C_pred, aux
 
 class CalibOnlyNet(nn.Module):
     """
@@ -287,6 +307,7 @@ class CalibOnlyNet(nn.Module):
         """
         fout_list = self.rgb_enc(rgb)
         s_pred_list = []
+        c_pred_list = []
         calib_aux_list = []
         H, W = dep_sp.shape[-2:]
 
@@ -297,9 +318,10 @@ class CalibOnlyNet(nn.Module):
             if K is not None:
                 Hl, Wl = s_l.shape[-2:]
                 K_l = _scale_intrinsics(K, sx=Wl / float(W), sy=Hl / float(H))
-            s_l_pred, calib_aux = self.calibs[l](s_l, m_l, fout_l, K_l=K_l)
+            s_l_pred, c_l_pred, calib_aux = self.calibs[l](s_l, m_l, fout_l, K_l=K_l)
             calib_aux["scale_hw"] = (s_l.shape[-2], s_l.shape[-1])
             s_pred_list.append(s_l_pred)
+            c_pred_list.append(c_l_pred)
             calib_aux_list.append(calib_aux)
 
-        return s_pred_list, calib_aux_list
+        return s_pred_list, c_pred_list, calib_aux_list

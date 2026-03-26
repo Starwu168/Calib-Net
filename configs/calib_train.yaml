@@ -69,7 +69,9 @@ model:
       use_channel_attn: true
       se_reduction: 8
 
-  pmp: {}
+  pmp:
+    bp_conf_prop_strength: 1.0
+    bp_conf_cspn_strength: 1.0
 
 loss:
   lambda_calib: 1.0
@@ -100,10 +102,12 @@ loss:
 
   # Calib-only losses
   calib:
-    supervision_target: "dense+sparse"
+    supervision_target: "dense"
     dense_sup_weight: 1.0
     sparse_sup_weight: 1.0
     w_point: 1.0
+    w_conf: 50
+    conf_tau: 1.0
     w_delta_reg: 0.05
     w_range_reg: 0.02
     ignore_top_rows: 0

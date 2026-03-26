@@ -66,6 +66,7 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
     ignore_top_rows = int(cfg_loss.get("ignore_top_rows", 0))
     gt_outlier_kernel_size = int(cfg_loss.get("gt_outlier_kernel_size", -1))
     gt_outlier_threshold = float(cfg_loss.get("gt_outlier_threshold", -1.0))
+    conf_tau = float(cfg_loss.get("conf_tau", 1.0))
     delta_weights = torch.tensor(
         cfg_loss.get("delta_reg_weights", (1.0, 1.0, 1.0)),
         dtype=dep_sup.dtype,
@@ -92,6 +93,7 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
     ).float()
 
     loss_point = dep_sup.new_zeros(())
+    loss_conf = dep_sup.new_zeros(())
     loss_delta_reg = dep_sup.new_zeros(())
     loss_range_reg = dep_sup.new_zeros(())
     valid_points_total = dep_sup.new_zeros(())
@@ -103,6 +105,7 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
         proj_u = calib_aux["proj_u"]
         proj_v = calib_aux["proj_v"]
         proj_z = calib_aux["proj_z"]
+        proj_conf = calib_aux.get("proj_conf")
         valid = calib_aux["valid"] > 0
         delta_xyz = calib_aux["delta_xyz"]
         range_xyz = calib_aux["range_xyz"]
@@ -116,6 +119,7 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
         inside = (u_full >= 0) & (u_full <= (W - 1)) & (v_full >= 0) & (v_full <= (H - 1))
         point_loss = dep_sup.new_zeros(())
         point_denom = dep_sup.new_zeros(())
+        conf_loss = dep_sup.new_zeros(())
 
         if use_hybrid_target:
             dense_valid_gt = _depth_valid_mask(
@@ -166,6 +170,14 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
                 )
                 point_loss = point_loss + dense_sup_weight * (dense_point_loss / (dense_point_denom + 1e-6))
                 point_denom = point_denom + dense_point_denom
+                if proj_conf is not None:
+                    dense_target_conf = torch.exp(-(proj_z - dense_sample).abs() / max(conf_tau, 1e-6))
+                    dense_conf_loss = F.smooth_l1_loss(
+                        proj_conf * dense_point_mask_f,
+                        dense_target_conf * dense_point_mask_f,
+                        reduction="sum",
+                    )
+                    conf_loss = conf_loss + dense_sup_weight * (dense_conf_loss / (dense_point_denom + 1e-6))
 
             if sparse_point_denom.detach().item() > 0.0 and sparse_sup_weight > 0.0:
                 sparse_point_loss = F.smooth_l1_loss(
@@ -175,6 +187,14 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
                 )
                 point_loss = point_loss + sparse_sup_weight * (sparse_point_loss / (sparse_point_denom + 1e-6))
                 point_denom = point_denom + sparse_point_denom
+                if proj_conf is not None:
+                    sparse_target_conf = torch.exp(-(proj_z - sparse_sample).abs() / max(conf_tau, 1e-6))
+                    sparse_conf_loss = F.smooth_l1_loss(
+                        proj_conf * sparse_point_mask_f,
+                        sparse_target_conf * sparse_point_mask_f,
+                        reduction="sum",
+                    )
+                    conf_loss = conf_loss + sparse_sup_weight * (sparse_conf_loss / (sparse_point_denom + 1e-6))
         else:
             gt_sample = _sample_dense_depth(dep_sup, u_full, v_full)
             gt_valid_sample = _sample_dense_depth(valid_gt, u_full, v_full)
@@ -186,9 +206,18 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
             if point_denom.detach().item() > 0.0:
                 point_loss = F.smooth_l1_loss(proj_z * point_mask_f, gt_sample * point_mask_f, reduction="sum")
                 point_loss = point_loss / (point_denom + 1e-6)
+                if proj_conf is not None:
+                    target_conf = torch.exp(-(proj_z - gt_sample).abs() / max(conf_tau, 1e-6))
+                    conf_loss = F.smooth_l1_loss(
+                        proj_conf * point_mask_f,
+                        target_conf * point_mask_f,
+                        reduction="sum",
+                    )
+                    conf_loss = conf_loss / (point_denom + 1e-6)
 
         if point_denom.detach().item() > 0.0:
             loss_point = loss_point + float(w) * point_loss
+            loss_conf = loss_conf + float(w) * conf_loss
             valid_points_total = valid_points_total + point_denom
 
         reg_mask = valid.float()
@@ -207,12 +236,14 @@ def compute_losses(calib_aux_list, dep_gt, cfg_loss: dict, dep_sparse_gt=None):
         mean_range = mean_range + float(w) * (range_pos * reg_mask).sum(dim=(0, 2, 3)) / reg_denom
 
     w_point = float(cfg_loss.get("w_point", 1.0))
+    w_conf = float(cfg_loss.get("w_conf", 0.0))
     w_delta_reg = float(cfg_loss.get("w_delta_reg", 0.0))
     w_range_reg = float(cfg_loss.get("w_range_reg", 0.0))
 
-    total = w_point * loss_point + w_delta_reg * loss_delta_reg + w_range_reg * loss_range_reg
+    total = w_point * loss_point + w_conf * loss_conf + w_delta_reg * loss_delta_reg + w_range_reg * loss_range_reg
     return total, {
         "loss_point": float(loss_point.detach().cpu()),
+        "loss_conf": float(loss_conf.detach().cpu()),
         "loss_delta_reg": float(loss_delta_reg.detach().cpu()),
         "loss_range_reg": float(loss_range_reg.detach().cpu()),
         "calib_supervision_sparse": float(1.0 if use_sparse_target else 0.0),

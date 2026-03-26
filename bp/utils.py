@@ -279,9 +279,10 @@ class CSPN(nn.Module):
     implementation of CSPN++
     """
 
-    def __init__(self, in_channels, pt, norm_layer=nn.BatchNorm2d, act=nn.ReLU, eps=1e-6):
+    def __init__(self, in_channels, pt, norm_layer=nn.BatchNorm2d, act=nn.ReLU, eps=1e-6, conf_strength=1.0):
         super().__init__()
         self.pt = pt
+        self.conf_strength = float(conf_strength)
         self.weight3x3 = GenKernel(in_channels, 3, norm_layer=norm_layer, act=act, eps=eps)
         self.weight5x5 = GenKernel(in_channels, 5, norm_layer=norm_layer, act=act, eps=eps)
         self.weight7x7 = GenKernel(in_channels, 7, norm_layer=norm_layer, act=act, eps=eps)
@@ -299,11 +300,15 @@ class CSPN(nn.Module):
         )
 
     @custom_fwd(cast_inputs=torch.float32)
-    def forward(self, fout, hn, h0):
+    def forward(self, fout, hn, h0, c0=None):
         weight3x3 = self.weight3x3(fout)
         weight5x5 = self.weight5x5(fout)
         weight7x7 = self.weight7x7(fout)
-        mask3x3, mask5x5, mask7x7 = torch.split(self.convmask(fout) * (h0 > 1e-3).float(), 1, dim=1)
+        valid0 = (h0 > 1e-3).float()
+        if c0 is None:
+            c0 = valid0
+        conf_gate = (1.0 - self.conf_strength) + self.conf_strength * c0.clamp(0.0, 1.0)
+        mask3x3, mask5x5, mask7x7 = torch.split(self.convmask(fout) * valid0 * conf_gate, 1, dim=1)
         conf3x3, conf5x5, conf7x7 = torch.split(self.convck(fout), 1, dim=1)
         hn3x3 = hn5x5 = hn7x7 = hn
         hns = [hn, ]
@@ -490,7 +495,7 @@ class WPool(nn.Module):
         self.drift = drift
         self.permute = Permute(in_ch, stride=2 ** level)
 
-    def forward(self, S, fout):
+    def forward(self, S, fout, V=None):
         W = self.permute(fout)
         size = int(2 ** self.level)
         M = (S > 1e-3).float()
@@ -501,7 +506,11 @@ class WPool(nn.Module):
         avgS = F.avg_pool2d(S * expW, kernel_size=size, stride=size)
         avgexpW = F.avg_pool2d(expW, kernel_size=size, stride=size)
         Sp = avgS / (avgexpW + 1e-6)
-        return Sp
+        if V is None:
+            return Sp
+        avgV = F.avg_pool2d(V * expW, kernel_size=size, stride=size)
+        Vp = avgV / (avgexpW + 1e-6)
+        return Sp, Vp
 
 
 class UpCat(nn.Module):
@@ -534,11 +543,12 @@ class Prop(nn.Module):
     """
     """
 
-    def __init__(self, Cfi, Cfp=3, Cfo=2, act=nn.GELU, norm_layer=nn.BatchNorm2d):
+    def __init__(self, Cfi, Cfp=3, Cfo=2, act=nn.GELU, norm_layer=nn.BatchNorm2d, conf_strength=1.0):
         super().__init__()
         """
         """
         self.dist = lambda x: (x * x).sum(1)
+        self.conf_strength = float(conf_strength)
         Ct = Cfo + Cfi + Cfi + Cfp
         self.convXF = nn.Sequential(
             Basic2d(in_channels=Ct, out_channels=Cfi, norm_layer=norm_layer, act=act, kernel_size=1,
@@ -555,7 +565,7 @@ class Prop(nn.Module):
         self.act = act()
         self.coef = Coef(Cfi, 3)
 
-    def forward(self, If, Pf, Ofnum, args):
+    def forward(self, If, Pf, Ofnum, args, Cf=None):
         """
         """
         num = args.shape[-2]
@@ -577,6 +587,14 @@ class Prop(nn.Module):
         XF = self.convXF(X)
         XF = self.act(XF + self.convXL(XF))
         Alpha, Beta, Omega = self.coef(XF)
+        if Cf is not None:
+            Cf = Cf.view(B, 1, 1, M)
+            Cfnum = torch.gather(
+                input=Cf.expand(B, 1, num, M),
+                dim=-1,
+                index=args.view(B, 1, num, N).expand(B, 1, num, N),
+            ).clamp_min(1e-4)
+            Omega = Omega + self.conf_strength * torch.log(Cfnum)
         Omega = torch.softmax(Omega, dim=2)
         dout = torch.sum(((Alpha + 1) * Pfnum[:, -1:] + Beta) * Omega, dim=2, keepdim=True)
         return dout.view(B, 1, H, W)
@@ -587,7 +605,7 @@ class PMP(nn.Module):
     Pre+MF+Post
     """
 
-    def __init__(self, level, in_ch, out_ch, drop_path, up=True, pool=True):
+    def __init__(self, level, in_ch, out_ch, drop_path, up=True, pool=True, conf_prop_strength=1.0, conf_cspn_strength=1.0):
         super().__init__()
         self.level = level
         if up:
@@ -599,10 +617,10 @@ class PMP(nn.Module):
         else:
             self.wpool = Ident()
         self.dist = Dist(num=4)
-        self.prop = Prop(out_ch)
+        self.prop = Prop(out_ch, conf_strength=conf_prop_strength)
         self.fuse = UBNet(out_ch, dplanes=3, blocknum=2, depth=5 - level, drop_path=drop_path)
         self.conv = Conv3x3(out_ch, 1, bias=True)
-        self.cspn = CSPN(out_ch, pt=2 * (6 - level))
+        self.cspn = CSPN(out_ch, pt=2 * (6 - level), conf_strength=conf_cspn_strength)
 
     def pinv(self, S, K, xx, yy):
         fx, fy, cx, cy = K[:, 0:1, 0:1], K[:, 1:2, 1:2], K[:, 0:1, 2:3], K[:, 1:2, 2:3] #(B,C,H,W)
@@ -615,9 +633,13 @@ class PMP(nn.Module):
         Pxyz = torch.cat([Px, Py, Pz], dim=1).contiguous() #(B,1,N)->(B,3,N)
         return Pxyz
 
-    def forward(self, fout, dout, XI, S, K):
+    def forward(self, fout, dout, XI, S, C, K):
         fout = self.upcat(XI, fout, dout) #(B,IN_C,H,W)
-        Sp = self.wpool(S, fout) #(B,1,H,W)
+        if isinstance(self.wpool, Ident):
+            Sp = self.wpool(S, fout)
+            Cp = C
+        else:
+            Sp, Cp = self.wpool(S, fout, V=C)
         Kp = K.clone()
         Kp[:, :2] = Kp[:, :2] / 2 ** self.level
         B, _, height, width = Sp.shape
@@ -627,7 +649,7 @@ class PMP(nn.Module):
         # Pre
         Pxyz = self.pinv(Sp, Kp, xx, yy) #(1,3,N)
         Ofnum, args = self.dist(Sp, xx, yy) #num+feature_tensor
-        dout = self.prop(fout, Pxyz, Ofnum, args)
+        dout = self.prop(fout, Pxyz, Ofnum, args, Cf=Cp)
         ###############################################################
         # MF
         Pxyz = self.pinv(dout, Kp, xx, yy).view(dout.shape[0], 3, dout.shape[2], dout.shape[3])
@@ -636,5 +658,5 @@ class PMP(nn.Module):
         dout = dout + res
         ###############################################################
         # Post
-        dout = self.cspn(fout, dout, Sp)
+        dout = self.cspn(fout, dout, Sp, c0=Cp)
         return fout, dout
