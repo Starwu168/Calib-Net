@@ -108,8 +108,8 @@ loss:
     w_point: 1.0
     w_conf: 50
     conf_tau: 1.0
-    w_delta_reg: 0.05
-    w_range_reg: 0.02
+    w_delta_reg: 0.5
+    w_range_reg: 0.2
     ignore_top_rows: 0
     depth_max: null
     gt_outlier_kernel_size: 7

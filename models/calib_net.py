@@ -109,6 +109,9 @@ class PerScaleCalib(nn.Module):
         blocks = [ResBlock(radar_c) for _ in range(refine_cfg["blocks"])]
         self.refine = nn.Sequential(*blocks)
         self.se = SEBlock(radar_c, refine_cfg.get("se_reduction", 8))
+        self.offset_adapter = ResBlock(radar_c)
+        self.conf_adapter = ResBlock(radar_c)
+        self.range_adapter = ResBlock(radar_c) if self.predict_xyz else None
 
         self.offset_head = nn.Sequential(
             nn.Conv2d(radar_c, radar_c, 3, 1, 1, bias=False),
@@ -223,10 +226,12 @@ class PerScaleCalib(nn.Module):
 
         Fprime = self.fuse_proj(torch.cat([R_t, Z], dim=1))
         delta_feat = self.se(self.refine(Fprime))
+        offset_feat = self.offset_adapter(delta_feat)
+        conf_feat = self.conf_adapter(delta_feat)
 
         # === 预测 ΔS (token 分辨率) ===
-        offset = self.offset_head(delta_feat)
-        conf = torch.sigmoid(self.conf_head(delta_feat))
+        offset = self.offset_head(offset_feat)
+        conf = torch.sigmoid(self.conf_head(conf_feat))
 
         # === 上采样回 Hl,Wl ===
         offset = F.interpolate(offset, size=(Hl, Wl), mode="nearest")
@@ -235,7 +240,8 @@ class PerScaleCalib(nn.Module):
         if self.predict_xyz:
             if K_l is None:
                 raise ValueError("K_l is required when predict_xyz=True")
-            range_raw = self.range_head(delta_feat)
+            range_feat = self.range_adapter(delta_feat)
+            range_raw = self.range_head(range_feat)
             range_raw = F.interpolate(range_raw, size=(Hl, Wl), mode="nearest")
             range_xyz = self.range_min_xyz + (self.range_max_xyz - self.range_min_xyz) * torch.sigmoid(range_raw)
             delta_xyz = range_xyz * torch.tanh(offset)
